@@ -150,6 +150,10 @@ void SubspaceCondensation::buildDag(
     std::vector<NodeTasks> nt(static_cast<size_t>(N_));
     const std::vector<int64_t>& order = ge_.postOrder();
 
+    // W（Mtemp = K̂⁻¹M̂）释放移交：f(i) 的 WMz = W·Z_i 复用后，
+    // 由本路径的 rel(i) 调 releaseNodeW（GE 的 DONE/relW 不再释放）。
+    ge_.deferWRelease();
+
     // 优先级与 GE 同一节点主序：SPEC=rank*8+7，f=+8，g/h=+9，rel=+10。
     std::vector<int64_t> rank(static_cast<size_t>(N_));
     for (int64_t r = 0; r < static_cast<int64_t>(order.size()); ++r)
@@ -224,10 +228,19 @@ void SubspaceCondensation::buildDag(
             }
             const bool isLeaf = ge_.isLeaf(i);
             const auto& Zi = res.Z[static_cast<size_t>(i)];
-            DenseMatrix Mz = isLeaf ? DenseMatrix(ge_.origMDiag(i)) * Zi
-                                    : ge_.mDiag(i).data * Zi;
+            // Mtemp 复用：K̂⁻¹(M̂·Z_i) = W·Z_i（结合律，同 GE 的 T3）。
+            // 统一 DAG 路径 W 存活 → 一次 gemm 代替"M̂·Z_i gemm + 回代"；
+            // 旧路径 ElimData 已销毁（nodeW 返回 nullptr）→ 回退原路径。
             DenseMatrix WMz;
-            ge_.solveFactor(i, Mz, WMz);
+            if (const DenseMatrix* W = ge_.nodeW(i)) {
+                ge_.ops().gemm(CblasNoTrans, CblasNoTrans, 1.0, *W, Zi, 0.0,
+                               WMz);
+            } else {
+                DenseMatrix Mz = isLeaf
+                                     ? DenseMatrix(ge_.origMDiag(i)) * Zi
+                                     : ge_.mDiag(i).data * Zi;
+                ge_.solveFactor(i, Mz, WMz);
+            }
             for (int64_t a : ge_.tree().ancestors(i)) {
                 DenseMatrix proj;
                 if (isLeaf)
@@ -372,6 +385,8 @@ void SubspaceCondensation::buildDag(
                     mbar_.erase(key_(i, kk));
                 mbarRow_.erase(i);
             }
+            // Mtemp（W = K̂⁻¹M̂）：缩聚 f 已用完（rel ← f），释放。
+            ge_.releaseNodeW(i);
             // GE 块（diag/耦合）与 Z：恢复向量时的 backtransform 仍需要
             // （旧路径 if(!keepFactors) releaseNode 同理），只在
             // releaseData（= !keepFactors）时缩容。
@@ -470,10 +485,17 @@ void SubspaceCondensation::projectNode_(int64_t i, Result& res) {
                 sInit.e.aux2 = ge_.level(i);
             }
             const auto& Zi = res.Z[static_cast<size_t>(i)];
-            DenseMatrix Mz = isLeaf ? DenseMatrix(ge_.origMDiag(i)) * Zi
-                                    : ge_.mDiag(i).data * Zi;
+            // 同 DAG 路径：Mtemp 复用（旧路径 nodeW 恒 nullptr → 回退）
             DenseMatrix WMz;
-            ge_.solveFactor(i, Mz, WMz);
+            if (const DenseMatrix* W = ge_.nodeW(i)) {
+                ge_.ops().gemm(CblasNoTrans, CblasNoTrans, 1.0, *W, Zi, 0.0,
+                               WMz);
+            } else {
+                DenseMatrix Mz = isLeaf
+                                     ? DenseMatrix(ge_.origMDiag(i)) * Zi
+                                     : ge_.mDiag(i).data * Zi;
+                ge_.solveFactor(i, Mz, WMz);
+            }
             for (int64_t a : anc) {
                 DenseMatrix proj;
                 if (isLeaf)

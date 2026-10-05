@@ -184,6 +184,7 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
     bool geRan = false;
     auto runFused = [&](const ISpectralTruncation<DefaultTraits>& tr,
                         SubspaceCondensation::Result& out) {
+        GaussianElimination::phaseProfReset();
         initRes(out);
         if (noFuse) {
             if (!geRan) {
@@ -281,6 +282,17 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
     if (optN.verbosity > 0) {
         for (const auto& [k, v] : ge.lastTiming())
             std::cout << "[amls]   消去." << k << "=" << v << "s\n";
+        {
+            using GP = GaussianElimination::GePhaseProf;
+            GP& p = GaussianElimination::phaseProf();
+            std::cout << "[amls]   探针.schurKdiag=" << p.schurKdiag
+                      << " schurKcoup=" << p.schurKcoup
+                      << " congDiagT=" << p.congDiagT
+                      << " congDiagWX=" << p.congDiagWX
+                      << " congCoup=" << p.congCoup
+                      << " solveRhs=" << p.solveRhs
+                      << " expandT=" << p.solveExpandT << "\n";
+        }
         for (const auto& [k, v] : cond.lastStageTiming())
             std::cout << "[amls]   缩聚." << k << "=" << v << "s\n";
     }

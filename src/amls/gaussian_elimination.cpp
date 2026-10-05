@@ -503,9 +503,9 @@ void GaussianElimination::factorNode_(int64_t i, ElimData& d) {
     if (tree_.ancestors(i).empty())
         return;   // 根节点：消去即完成（同余更新无接收方，W 亦不需要）
 
-    // M̂_ii 缓存（T3 结合律的右乘因子；D/E 任务及 makeWX_ 读）。
-    // 必须在全部后代完成后执行——DAG 中由节点就绪条件（孩子 DONE）保证。
-    d.W = leaf ? DenseMatrix(origMDiag_.at(i)) : mDiagTarget_(i).data;
+    // 注：原在此缓存 d.W = M̂（T3 右乘因子）。已改为 makeWX_ 首次需要时
+    // 直接物化 Mtemp W̃ = K̂⁻¹M̂（一次宽回代），供 WX_a = W̃·X_a 与
+    // 缩聚 f 的 WMz = W̃·Z_i 共同复用——M̂ 本身不再缓存。
 }
 
 void GaussianElimination::solveXYAnc_(int64_t i, ElimData& d, int64_t a,
@@ -528,11 +528,12 @@ void GaussianElimination::solveXYAnc_(int64_t i, ElimData& d, int64_t a,
                  it; ++it)
                 mk.set(it.row());
         auto idx = mk.indices();
-        auto& colsMap = isK ? d.xCols : d.yCols;
         auto& out = isK ? d.X[a] : d.Y[a];
-        colsMap[a] = idx;
-        out = DenseMatrix::Zero(size_[static_cast<size_t>(i)], na);
-        if (idx.empty()) return true;   // 全零右端 → 全零解
+        out.full = na;
+        out.ident = false;
+        out.cols = idx;
+        out.data.resize(0, 0);
+        if (idx.empty()) return true;   // 全零右端 → 空表解
         DenseMatrix Bsub =
             DenseMatrix::Zero(size_[static_cast<size_t>(i)],
                               static_cast<int64_t>(idx.size()));
@@ -544,23 +545,20 @@ void GaussianElimination::solveXYAnc_(int64_t i, ElimData& d, int64_t a,
                      A, static_cast<Index>(c));
                  it; ++it)
                 Bsub(c, pos[static_cast<size_t>(it.row())]) = it.value();
-        DenseMatrix Xsub;
-        solveFactor(i, Bsub, Xsub);
-        scatterCols(out, Xsub, idx);
+        solveFactor(i, Bsub, out.data);
         return true;
     };
     auto buildSubDense = [&](const ColComp& Cc, bool isK) {
         // Cc = (a,i) 列压缩块：右端 = expandT（m×na）后 scan 非零列。
         const DenseMatrix R = ops().expandT(Cc);
         auto idx = nonzeroColIdx(R);
-        auto& colsMap = isK ? d.xCols : d.yCols;
         auto& out = isK ? d.X[a] : d.Y[a];
-        colsMap[a] = idx;
-        out = DenseMatrix::Zero(R.rows(), na);
+        out.full = na;
+        out.ident = false;
+        out.cols = idx;
+        out.data.resize(0, 0);
         if (idx.empty()) return;
-        DenseMatrix Xsub;
-        solveFactor(i, gatherCols(R, idx), Xsub);
-        scatterCols(out, Xsub, idx);
+        solveFactor(i, gatherCols(R, idx), out.data);
     };
     if (leaf) {
         buildSub(origK_(a, i), true);
@@ -589,10 +587,10 @@ void GaussianElimination::solveXYAnc_(int64_t i, ElimData& d, int64_t a,
             bs.nonzeroCols = kb.storedCols();
             bs.kFrac = significantFrac(kb.data);
         }
-        bs.xNZRows = significantRows(d.X.at(a));
-        bs.yNZRows = significantRows(d.Y.at(a));
-        bs.xFrac = significantFrac(d.X.at(a));
-        bs.yFrac = significantFrac(d.Y.at(a));
+        bs.xNZRows = significantRows(d.X.at(a).data);
+        bs.yNZRows = significantRows(d.Y.at(a).data);
+        bs.xFrac = significantFrac(d.X.at(a).data);
+        bs.yFrac = significantFrac(d.Y.at(a).data);
         std::lock_guard<std::mutex> lk(statsMutex_);
         stats->blocks.push_back(bs);
     }
@@ -651,23 +649,41 @@ void GaussianElimination::computeNodeA_(int64_t i, ElimData& d) {
     solveXY_(i, d);
 }
 
-const GaussianElimination::DenseMatrix&
+const ColComp&
 GaussianElimination::makeWX_(int64_t i, ElimData& d, int64_t a) const {
-    // T3 结合律：K_{a,i}·(K̂⁻¹M̂)·X_a = K_{a,i}·K̂⁻¹·(M̂·X_a)——
-    // wx 只对 X_a 的非零列先乘 M̂ 再回代（不物化 W，避免 m×m 全回代）。
-    // 结果按祖先缓存：C 任务（DAG）算一次，E 的 diag/coup 多处复用。
+    // T3 结合律：K_{a,i}·(K̂⁻¹M̂)·X_a = K_{a,i}·W̃·X_a（W̃ = K̂⁻¹M̂）。
+    // Mtemp W̃ 节点级惰性物化：首次进入时一次宽回代（wMut 互斥，
+    // per 祖先 C 任务可并发首次进入），之后本节点全部复用：
+    //   GE  C/E：WX_a = W̃·X_a（gemm，免逐次窄回代）
+    //   缩聚 f：WMz = W̃·Z_i（式 16/17a，释放由 cond.rel(i) 托管）
+    // X_a 已 ColComp 窄存（data = n_i×c_a）：WX_a = W̃·X_a.data 窄 gemm，
+    // 窄存 ColComp{cols=X_a.cols} 供 E 任务的交集列跳过消费。
     auto it = d.WX.find(a);
     if (it != d.WX.end() && it->second.has_value())
         return *it->second;
-    const DenseMatrix& Xa = d.X.at(a);
-    DenseMatrix wx = DenseMatrix::Zero(Xa.rows(), Xa.cols());
-    const auto itc = d.xCols.find(a);
-    if (itc != d.xCols.end() && !itc->second.empty()) {
-        DenseMatrix MXg, Wg;
-        ops().gemm(CblasNoTrans, CblasNoTrans, 1.0, d.W,
-                   gatherCols(Xa, itc->second), 0.0, MXg);
-        solveFactor(i, MXg, Wg);
-        scatterCols(wx, Wg, itc->second);
+    {
+        std::lock_guard<std::mutex> lk(d.wMut);
+        if (!d.wTransformed) {
+            const bool leaf = isLeaf(i);
+            // M̂ 在 F(i)（=全部后代消去完成）后终态，此处拷贝安全。
+            const DenseMatrix Mh = leaf
+                                       ? DenseMatrix(origMDiag_.at(i))
+                                       : DenseMatrix(mDiag(i).data);
+            DenseMatrix Wt;
+            solveFactor(i, Mh, Wt);
+            d.W = std::move(Wt);
+            d.wTransformed = true;
+        }
+    }
+    ColComp wx;
+    wx.full = d.X.at(a).full;
+    wx.ident = false;
+    wx.cols = d.X.at(a).cols;
+    if (!wx.cols.empty()) {
+        DenseMatrix WXg;
+        ops().gemm(CblasNoTrans, CblasNoTrans, 1.0, d.W, d.X.at(a).data,
+                   0.0, WXg);
+        wx.data = std::move(WXg);
     }
     if (it != d.WX.end()) {
         it->second = std::move(wx);
@@ -683,7 +699,7 @@ void GaussianElimination::schurKDiagTask_(int64_t i, ElimData& d, int64_t a,
     // 尾部大任务（观测 3.2s 级）在就绪队列空闸下临时放开 BLAS 多线程。
     const double gf =
         2.0 * size_[static_cast<size_t>(a)] * size_[static_cast<size_t>(i)] *
-        d.X.at(a).cols() / 1e9;
+        d.X.at(a).storedCols() / 1e9;
     auto mb = blas::maybeBudget(gf);
     std::lock_guard<std::mutex> lk(keyLock_(a));
     ColComp& tgt = kDiagTarget_(a);
@@ -702,7 +718,7 @@ void GaussianElimination::schurKCoupTask_(int64_t i, ElimData& d, int64_t hi,
     const auto tp0 = std::chrono::steady_clock::now();
     const double gf =
         2.0 * size_[static_cast<size_t>(hi)] * size_[static_cast<size_t>(i)] *
-        d.X.at(lo).cols() / 1e9;
+        d.X.at(lo).storedCols() / 1e9;
     auto mb = blas::maybeBudget(gf);
     std::lock_guard<std::mutex> lk(keyLock_(key_(hi, lo)));
     ColComp& tgt = kCoupTarget_(hi, lo);
@@ -722,12 +738,12 @@ void GaussianElimination::congDiagTask_(int64_t i, ElimData& d, int64_t a,
     double kw = 0;
     const auto itw = d.WX.find(a);
     if (itw != d.WX.end() && itw->second)
-        kw = static_cast<double>(itw->second->cols());
+        kw = static_cast<double>(itw->second->storedCols());
     const double gf =
         2.0 * size_[static_cast<size_t>(a)] * size_[static_cast<size_t>(i)] *
-        (2.0 * d.Y.at(a).cols() + kw) / 1e9;
+        (2.0 * d.Y.at(a).storedCols() + kw) / 1e9;
     auto mb = blas::maybeBudget(gf);
-    const DenseMatrix& wx = makeWX_(i, d, a);
+    const ColComp& wx = makeWX_(i, d, a);
     profAdd(prof.congDiagWX,
             std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - tp0).count());
@@ -756,14 +772,14 @@ void GaussianElimination::congCoupTask_(int64_t i, ElimData& d, int64_t hi,
     double kw = 0;
     const auto itw = d.WX.find(lo);
     if (itw != d.WX.end() && itw->second)
-        kw = static_cast<double>(itw->second->cols());
+        kw = static_cast<double>(itw->second->storedCols());
     const double gf =
         2.0 * size_[static_cast<size_t>(i)] *
-        (size_[static_cast<size_t>(hi)] * (d.Y.at(lo).cols() + kw) +
-         size_[static_cast<size_t>(lo)] * d.Y.at(hi).cols()) /
+        (size_[static_cast<size_t>(hi)] * (d.Y.at(lo).storedCols() + kw) +
+         size_[static_cast<size_t>(lo)] * d.Y.at(hi).storedCols()) /
         1e9;
     auto mb = blas::maybeBudget(gf);
-    const DenseMatrix& wx = makeWX_(i, d, lo);
+    const ColComp& wx = makeWX_(i, d, lo);
     std::lock_guard<std::mutex> lk(keyLock_(key_(hi, lo)));
     ColComp& tgt = mCoupTarget_(hi, lo);
     if (leaf) {
@@ -901,7 +917,7 @@ void GaussianElimination::buildDag(DagRunner& dag, GeDagTasks& out) {
         DagTask* relW = nullptr;
     };
     std::vector<NodeTasks> nt(static_cast<size_t>(N_));
-    std::vector<std::shared_ptr<ElimData>> data(static_cast<size_t>(N_));
+    dagData_.assign(static_cast<size_t>(N_), nullptr);
     trace::mark("meta", "ge.begin", N_, maxLevel_);
 
     // 优先级 = 后序 rank*8 + phase（F0 B1 C2 D3 E4 rel5 DONE6）。
@@ -920,20 +936,16 @@ void GaussianElimination::buildDag(DagRunner& dag, GeDagTasks& out) {
         const int64_t lv = level_[static_cast<size_t>(i)];
         const int64_t ni = size_[static_cast<size_t>(i)];
         auto d = std::make_shared<ElimData>();
-        data[static_cast<size_t>(i)] = d;
+        dagData_[static_cast<size_t>(i)] = d;
         // 预填全部键：任务阶段多线程只做值写入，unordered_map 无结构
         // 变更（并发插入会损坏桶结构——回归测试 out_of_range 的根因）。
         d->X.reserve(static_cast<size_t>(A) * 2);
         d->Y.reserve(static_cast<size_t>(A) * 2);
-        d->xCols.reserve(static_cast<size_t>(A) * 2);
-        d->yCols.reserve(static_cast<size_t>(A) * 2);
         d->WX.reserve(static_cast<size_t>(A) * 2);
         for (int64_t a : anc) {
-            d->X.emplace(a, DenseMatrix());
-            d->Y.emplace(a, DenseMatrix());
-            d->xCols.emplace(a, std::vector<int32_t>());
-            d->yCols.emplace(a, std::vector<int32_t>());
-            d->WX.emplace(a, std::optional<DenseMatrix>());
+            d->X.emplace(a, ColComp());
+            d->Y.emplace(a, ColComp());
+            d->WX.emplace(a, std::optional<ColComp>());
         }
         auto& t = nt[static_cast<size_t>(i)];
 
@@ -1051,7 +1063,10 @@ void GaussianElimination::buildDag(DagRunner& dag, GeDagTasks& out) {
                 });
             t.relWX[static_cast<size_t>(u)]->prio = pr + 5;
         }
-        t.relW = &dag.emplace([d] { d->W.resize(0, 0); });
+        t.relW = &dag.emplace([this, d] {
+            if (!wReleaseDeferred_)
+                d->W.resize(0, 0);
+        });
         t.relW->prio = pr + 5;
         // 根节点 A=0 时下方循环全空 → relW 无依赖、又不是 ready 种子
         //（solver 只 ready 叶子 F）→ 悬挂；而 DONE 无条件等 relW，连带
@@ -1099,7 +1114,10 @@ void GaussianElimination::buildDag(DagRunner& dag, GeDagTasks& out) {
                 d->Y.clear();
                 d->WX.clear();
             }
-            d->W.resize(0, 0);
+            // W（Mtemp = K̂⁻¹M̂）在统一 DAG 路径下移交给缩聚复用
+            // （f: WMz = W·Z_i），cond.rel(i) 才释放；旧路径此处释放。
+            if (!wReleaseDeferred_)
+                d->W.resize(0, 0);
             // 负载自适应：每完成一个节点判定一次饥饿（就绪空 + 活跃少），
             // 连续 3 个节点成立则升任务内并行度档（只升不降）。
             const int before = dag.taskParallelism();
@@ -1151,6 +1169,24 @@ void GaussianElimination::releaseNode(int64_t i) {
         kCoupD_.erase(k);
         mCoupD_.erase(k);
     }
+}
+
+const GaussianElimination::DenseMatrix* GaussianElimination::nodeW(
+    int64_t i) const {
+    if (static_cast<size_t>(i) >= dagData_.size())
+        return nullptr;
+    const auto& d = dagData_[static_cast<size_t>(i)];
+    if (!d || d->W.size() == 0)
+        return nullptr;
+    return &d->W;
+}
+
+void GaussianElimination::releaseNodeW(int64_t i) const {
+    if (static_cast<size_t>(i) >= dagData_.size())
+        return;
+    const auto& d = dagData_[static_cast<size_t>(i)];
+    if (d)
+        d->W.resize(0, 0);
 }
 
 void GaussianElimination::shrinkNodeData(int64_t i, bool releaseFactor) const {

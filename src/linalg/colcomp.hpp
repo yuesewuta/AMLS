@@ -234,15 +234,35 @@ public:
     virtual void subMul(ColComp& A, const ColComp& B, const Dense& C) const = 0;
     virtual void subMul(Dense& A, const Sparse& B, const Dense& C) const = 0;
     virtual void subMul(ColComp& A, const Sparse& B, const Dense& C) const = 0;
+    /// A ±= B·C，C 为列压缩右端（约束量 Ψ 的存储形式）：积只落在
+    /// A.cols ∩ C.cols 上（右端零列 ⇒ 目标列零增量，整列跳过——
+    /// dgemm 的 n 维按交集缩小，零列占比高时省掉相应比例的计算）。
+    virtual void subMul(Dense& A, const ColComp& B, const ColComp& C) const = 0;
+    virtual void subMul(ColComp& A, const ColComp& B, const ColComp& C) const = 0;
+    virtual void subMul(Dense& A, const Sparse& B, const ColComp& C) const = 0;
+    virtual void subMul(ColComp& A, const Sparse& B, const ColComp& C) const = 0;
     /// A += B·C（同余三重积 −K·W·X 项的相反号路径）。
     virtual void addMul(ColComp& A, const ColComp& B, const Dense& C) const = 0;
     virtual void addMul(ColComp& A, const Sparse& B, const Dense& C) const = 0;
+    /// A += B·C（C 列压缩右端；同 subMul 的交集列跳过）。
+    virtual void addMul(ColComp& A, const ColComp& B, const ColComp& C) const = 0;
+    virtual void addMul(ColComp& A, const Sparse& B, const ColComp& C) const = 0;
 
     /// A ±= (B·C)ᵀ（同余转置项；B 为 lo 侧乘子，结果限制在 A 的存储列）。
     virtual void subTransMul(ColComp& A, const ColComp& B, const Dense& C) const = 0;
     virtual void subTransMul(ColComp& A, const Sparse& B, const Dense& C) const = 0;
     virtual void addTransMul(ColComp& A, const ColComp& B, const Dense& C) const = 0;
     virtual void addTransMul(ColComp& A, const Sparse& B, const Dense& C) const = 0;
+    /// A ±= (B·C)ᵀ，C 列压缩右端。转置项的积按 Cᵀ 展开，C 的存储列
+    /// 全数参与（无列跳过收益），仅存储/类型适配。
+    virtual void subTransMul(ColComp& A, const ColComp& B,
+                             const ColComp& C) const = 0;
+    virtual void subTransMul(ColComp& A, const Sparse& B,
+                             const ColComp& C) const = 0;
+    virtual void addTransMul(ColComp& A, const ColComp& B,
+                             const ColComp& C) const = 0;
+    virtual void addTransMul(ColComp& A, const Sparse& B,
+                             const ColComp& C) const = 0;
 
     /// B·C 的稠密物化（同余对角项中间量 t / t2）。
     virtual Dense mul(const ColComp& B, const Dense& C) const = 0;
@@ -368,6 +388,59 @@ public:
         accTransMulSparse(A, B, C, +1.0);
     }
 
+    void subMul(Dense& A, const ColComp& B, const ColComp& C) const override {
+        // 目标全宽 + 乘子列压缩 + 右端列压缩：积只落在 A 的 C.cols 列。
+        if (B.empty() || C.empty()) return;
+        if (B.ident) {
+            std::vector<int64_t> phys;
+            phys.reserve(C.cols.size());
+            for (int32_t l : C.cols) phys.push_back(static_cast<int64_t>(l));
+            segAxpy(A, phys, B.data, C.data, -1.0);
+            return;
+        }
+        const Dense Cg = rows(C.data, B.cols);
+        std::vector<int64_t> phys;
+        phys.reserve(C.cols.size());
+        for (int32_t l : C.cols) phys.push_back(static_cast<int64_t>(l));
+        segAxpy(A, phys, B.data, Cg, -1.0);
+    }
+    void subMul(ColComp& A, const ColComp& B, const ColComp& C) const override {
+        accMulCC(A, B, C, -1.0);
+    }
+    void subMul(Dense& A, const Sparse& B, const ColComp& C) const override {
+        if (C.empty()) return;
+        const Dense t = B * C.data;
+        std::vector<int64_t> phys;
+        phys.reserve(C.cols.size());
+        for (int32_t l : C.cols) phys.push_back(static_cast<int64_t>(l));
+        segAdd(A, phys, t, -1.0);
+    }
+    void subMul(ColComp& A, const Sparse& B, const ColComp& C) const override {
+        accMulSparseCC(A, B, C, -1.0);
+    }
+    void addMul(ColComp& A, const ColComp& B, const ColComp& C) const override {
+        accMulCC(A, B, C, +1.0);
+    }
+    void addMul(ColComp& A, const Sparse& B, const ColComp& C) const override {
+        accMulSparseCC(A, B, C, +1.0);
+    }
+    void subTransMul(ColComp& A, const ColComp& B,
+                     const ColComp& C) const override {
+        accMulTransCC(A, B, C, -1.0);
+    }
+    void subTransMul(ColComp& A, const Sparse& B,
+                     const ColComp& C) const override {
+        accMulTransSparseCC(A, B, C, -1.0);
+    }
+    void addTransMul(ColComp& A, const ColComp& B,
+                     const ColComp& C) const override {
+        accMulTransCC(A, B, C, +1.0);
+    }
+    void addTransMul(ColComp& A, const Sparse& B,
+                     const ColComp& C) const override {
+        accMulTransSparseCC(A, B, C, +1.0);
+    }
+
     Dense mul(const ColComp& B, const Dense& C) const override {
         Dense out;
         gemm(CblasNoTrans, CblasNoTrans, 1.0, B, C, 0.0, out);
@@ -398,6 +471,176 @@ public:
     static bool parWorthy(int64_t m, int64_t n, int64_t k) {
         const int nt = opsTlsThreads();
         return nt > 1 && n >= 2 * nt && 2.0 * m * n * k >= 2.0e8;
+    }
+
+    // ---- 列压缩右端（约束量 Ψ = K̂⁻¹K_{i,·} 的存储形式）公共实现 ----
+    /// keep = {A 的物理列下标 j : A.cols[j] ∈ C.cols}（两升序归并）。
+    /// 右端零列 ⇒ 积列零增量 ⇒ 目标物理列整列跳过（dgemm n 维缩小）。
+    static std::vector<int64_t> keepCols(const ColComp& A, const ColComp& C) {
+        std::vector<int64_t> keep;
+        const auto& ac = A.cols;
+        const auto& cc = C.cols;
+        size_t p = 0;
+        for (size_t j = 0; j < ac.size(); ++j) {
+            while (p < cc.size() &&
+                   cc[p] < ac[static_cast<size_t>(j)])
+                ++p;
+            if (p < cc.size() && cc[p] == ac[static_cast<size_t>(j)])
+                keep.push_back(static_cast<int64_t>(j));
+        }
+        return keep;
+    }
+    /// C 的逻辑列号 l → C.data 物理列（l 必须在 C.cols 中）。
+    static int64_t physOf(const ColComp& C, int32_t l) {
+        const auto it =
+            std::lower_bound(C.cols.begin(), C.cols.end(), l);
+        return static_cast<int64_t>(it - C.cols.begin());
+    }
+    /// Adata 的 phys（升序物理列，A.ident 时即逻辑列）按连续段做
+    /// Adata(:,seg) ±= sign·M·R(:,对应段)。R 的列与 phys 一一对应。
+    static void segAxpy(Dense& Adata, const std::vector<int64_t>& phys,
+                        const Dense& M, const Dense& R, double sign) {
+        size_t s = 0;
+        const int m = static_cast<int>(Adata.rows());
+        const int k = static_cast<int>(M.cols());
+        while (s < phys.size()) {
+            size_t e = s + 1;
+            while (e < phys.size() && phys[e] == phys[e - 1] + 1)
+                ++e;
+            const int64_t j0 = phys[s];
+            const int jn = static_cast<int>(e - s);
+            double* cPtr =
+                Adata.data() + j0 * static_cast<int64_t>(Adata.rows());
+            cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, m, jn, k,
+                        sign, M.data(), static_cast<int>(M.rows()),
+                        R.data() + s * static_cast<int64_t>(R.rows()),
+                        static_cast<int>(R.rows()), 1.0, cPtr, m);
+            s = e;
+        }
+    }
+    /// 非转置、B 稠密乘子：A ±= B·C（C 列压缩右端）。
+    static void accMulCC(ColComp& A, const ColComp& B, const ColComp& C,
+                         double sign) {
+        if (B.empty() || A.empty() || C.empty()) return;
+        if (A.ident) {
+            // A 全宽：更新列 = C.cols（逻辑列号即物理列）；右端行按
+            // B.cols gather（B.ident 免 gather，右端即 C.data 全行）
+            const Dense Cg = B.ident ? Dense(C.data) : rows(C.data, B.cols);
+            std::vector<int64_t> phys;
+            phys.reserve(C.cols.size());
+            for (int32_t l : C.cols) phys.push_back(static_cast<int64_t>(l));
+            segAxpy(A.data, phys, B.data, Cg, sign);
+            return;
+        }
+        const auto keep = keepCols(A, C);
+        if (keep.empty()) return;   // 右端零列 ⇒ 无增量
+        // Cg(r,t) = C.data(B.cols[r], physC(A.cols[keep[t]]))
+        const int64_t cb = B.ident ? B.data.cols()
+                                   : static_cast<int64_t>(B.cols.size());
+        Dense Cg(cb, static_cast<int64_t>(keep.size()));
+        for (size_t t = 0; t < keep.size(); ++t) {
+            const int64_t pc = physOf(C, A.cols[static_cast<size_t>(keep[t])]);
+            if (B.ident)
+                Cg.col(static_cast<int64_t>(t)) = C.data.col(pc);
+            else
+                for (int64_t r = 0; r < cb; ++r)
+                    Cg(r, static_cast<int64_t>(t)) =
+                        C.data(B.cols[static_cast<size_t>(r)], pc);
+        }
+        segAxpy(A.data, keep, B.data, Cg, sign);
+    }
+    /// 非转置、B 稀疏乘子：A ±= B·C（B 的列 = i 全行，右端行免 gather）。
+    static void accMulSparseCC(ColComp& A, const Sparse& B, const ColComp& C,
+                               double sign) {
+        if (A.empty() || C.empty()) return;
+        if (A.ident) {
+            const Dense t = B * C.data;
+            for (size_t j = 0; j < C.cols.size(); ++j) {
+                const auto col = t.col(static_cast<int64_t>(j));
+                if (sign > 0) A.data.col(C.cols[j]) += col;
+                else A.data.col(C.cols[j]) -= col;
+            }
+            return;
+        }
+        const auto keep = keepCols(A, C);
+        if (keep.empty()) return;
+        Dense Cg(C.data.rows(), static_cast<int64_t>(keep.size()));
+        for (size_t t = 0; t < keep.size(); ++t)
+            Cg.col(static_cast<int64_t>(t)) =
+                C.data.col(physOf(C, A.cols[static_cast<size_t>(keep[t])]));
+        const Dense t = B * Cg;
+        // A.data 的物理列 = keep 本身（j 即物理下标）
+        segAdd(A.data, keep, t, sign);
+    }
+    /// Adata 的 phys（升序物理列）按连续段 ±= T 的对应列（T 已完整算出）。
+    static void segAdd(Dense& Adata, const std::vector<int64_t>& phys,
+                       const Dense& T, double sign) {
+        size_t s = 0;
+        while (s < phys.size()) {
+            size_t e = s + 1;
+            while (e < phys.size() && phys[e] == phys[e - 1] + 1)
+                ++e;
+            const int64_t j0 = phys[s];
+            const int64_t jn = static_cast<int64_t>(e - s);
+            if (sign > 0)
+                Adata.block(0, j0, Adata.rows(), jn) +=
+                    T.block(0, static_cast<int64_t>(s), Adata.rows(), jn);
+            else
+                Adata.block(0, j0, Adata.rows(), jn) -=
+                    T.block(0, static_cast<int64_t>(s), Adata.rows(), jn);
+            s = e;
+        }
+    }
+    /// 转置、B 稠密乘子：A ±= (B·C)ᵀ（C 列压缩；行空间来自 C 的存储列，
+    /// 只算 C.cols 行再写回 A.data 对应行，零行跳过）。
+    static void accMulTransCC(ColComp& A, const ColComp& B, const ColComp& C,
+                              double sign) {
+        if (B.empty() || A.empty() || C.empty()) return;
+        const Dense Cg = B.ident ? Dense(C.data) : rows(C.data, B.cols);
+        if (A.ident) {
+            // 全宽行散布：out = Cgᵀ·B.dataᵀ（c_c×n_A 全行宽），
+            // 行写回 C.cols（(B·C)ᵀ 的非零行 = C 的存储列）。
+            Dense out;
+            dgemm(CblasTrans, CblasTrans, sign, Cg, B.data, 0.0, out);
+            for (size_t r = 0; r < C.cols.size(); ++r)
+                A.data.row(C.cols[static_cast<size_t>(r)]) +=
+                    out.row(static_cast<int64_t>(r));
+            return;
+        }
+        const Dense S =
+            B.ident ? rows(B.data, A.cols) : sub(B.data, A.cols, B.cols);
+        Dense out;   // c_c × c_a（行 = C 的存储列）
+        dgemm(CblasTrans, CblasTrans, sign, Cg, S, 0.0, out);
+        for (size_t r = 0; r < C.cols.size(); ++r)
+            A.data.row(C.cols[r]) += out.row(static_cast<int64_t>(r));
+    }
+    /// 转置、B 稀疏乘子：A ±= (B·C)ᵀ（= Cᵀ·Bᵀ(:,A.cols)，C 窄存直接乘）。
+    static void accMulTransSparseCC(ColComp& A, const Sparse& B,
+                                    const ColComp& C, double sign) {
+        if (A.empty() || C.empty()) return;
+        if (A.ident) {
+            // 全宽行散布：t = B·C.data（n_A×c_c），A.data 的行 C.cols
+            // ±= t 的对应列（转置）。行号 = C 的逻辑列号。
+            const Dense t = B * C.data;
+            for (size_t j = 0; j < C.cols.size(); ++j) {
+                const auto colT = t.col(static_cast<int64_t>(j)).transpose();
+                if (sign > 0) A.data.row(C.cols[static_cast<size_t>(j)]) += colT;
+                else A.data.row(C.cols[static_cast<size_t>(j)]) -= colT;
+            }
+            return;
+        }
+        const Dense Br = rowsSparse(B, A.cols);   // (c_a×n_i)
+        // Cᵀ 的"行" = C 的存储列：结果 (c_c×c_a)，行写回 C.cols 行
+        Dense out;
+        dgemm(CblasTrans, CblasTrans, sign, C.data, Br, 0.0, out);
+        for (size_t r = 0; r < C.cols.size(); ++r)
+            A.data.row(C.cols[r]) += out.row(static_cast<int64_t>(r));
+    }
+    static std::vector<int64_t> iotaCols(int64_t n) {
+        std::vector<int64_t> v(static_cast<size_t>(n));
+        for (int64_t j = 0; j < n; ++j)
+            v[static_cast<size_t>(j)] = j;
+        return v;
     }
     static void accMul(ColComp& A, const ColComp& B, const Dense& C,
                        double sign, bool trans) {
@@ -504,6 +747,7 @@ public:
         const int m = static_cast<int>((ta == CblasNoTrans) ? A.rows() : A.cols());
         const int k = static_cast<int>((ta == CblasNoTrans) ? A.cols() : A.rows());
         const int n = static_cast<int>((tb == CblasNoTrans) ? B.cols() : B.rows());
+        if (C.rows() != m || C.cols() != n) C.resize(m, n);
         cblas_dgemm(CblasColMajor, ta, tb, m, n, k, alpha, A.data(),
                     static_cast<int>(A.rows()), B.data(),
                     static_cast<int>(B.rows()), beta, C.data(),

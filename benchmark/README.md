@@ -26,16 +26,18 @@ python tools/make_reference.py         # 2. 求前 200 阶参考解 + mtx→bin 
 
 - 脚本**可断点续跑**：已存在 `benchmark/reference/<name>_ref200.npz` 的矩阵自动跳过；
   删除对应 npz 可强制重算单个矩阵（或用 `--only 名字`）。
-- 运行环境：conda base（需 numpy + scipy，`pip install numpy scipy`）。
+- 运行环境：conda base（`pip install numpy scipy pyamg`；pyamg 仅 20 万阶以上矩阵的参考解需要）。
 
 ### 求解策略
 
-- n ≤ 130 000：`scipy.sparse.linalg.splu` 分解 + ARPACK 移位反演（小负移位 σ=−1e-8·‖K‖，
-  即使矩阵半正定含刚体模态也能稳定分解），可靠求最小 200 阶；bcsstk13 已与稠密分解交叉验证
-  （前 200 阶最大相对误差 5.4e-10）。
-- n > 130 000（thermomech_dK、boneS10）：移位反演分解代价过高，直接 ARPACK `which='SA'`
-  求**代数上**最小的 200 阶（含刚体模态时最低几阶为 0，结果一致）。
-  大矩阵这一步可能需要数小时，属一次性成本。
+- n ≤ 130 000：`scipy.sparse.linalg.splu` 精确分解 + ARPACK 移位反演（小负移位
+  σ=−1e-8·‖K‖，即使矩阵半正定含刚体模态也能稳定分解），可靠求最小 200 阶；
+  bcsstk13 已与稠密分解交叉验证（前 200 阶最大相对误差 5.4e-10）。
+- n > 130 000（thermomech_dK、boneS10）：3D 刚度矩阵的直接 LU fill-in 过大
+  （本机仅 16 GB 内存），纯 ARPACK `which='SA'` 对内特征值收敛极慢；改用
+  **LOBPCG + PyAMG 代数多重网格预条件**（smoothed aggregation，多取 16 阶共 216 阶
+  保证第 200 阶质量），低内存且收敛快；该路线已在 thermomech_TK 上与移位反演结果
+  交叉验证。大矩阵总耗时（AMG 建层 + LOBPCG）约十几分钟到一小时，属一次性成本。
 
 ### 病态谱的处理（质量阵缩放）
 
@@ -101,9 +103,27 @@ python tools/compare_reference.py bcsstk13     # 单个矩阵
 
 ```
 benchmark/
-├── matrices/<组>/<名>.mtx    下载的原始矩阵（不入库）
+├── matrices/<名>/<名>.mtx    下载的原始矩阵（不入库；tar 包顶层即矩阵名目录）
 ├── bin/<名>.bin              mtx 的二进制缓存（不入库）
 ├── reference/<名>_ref200.npz 参考特征值 mu/lam/f、alpha、f_user（不入库）
 ├── results/                  AMLS 求解输出
 └── f_user.csv                各矩阵 f200 与 f_user 汇总
 ```
+
+## 已生成的参考解（实测）
+
+| 矩阵 | n | μ₁ | μ₂₀₀ | f₂₀₀ (Hz) | f_user (Hz) | α |
+|---|---|---|---|---|---|---|
+| bcsstk13 | 2 003 | 2.84e2 | 2.90e5 | 85.71 | 90 | 1 |
+| s1rmq4m1 | 5 489 | 3.80e−1 | 1.18e1 | 0.5458 | 0.6 | 1 |
+| bcsstk18 | 11 948 | 1.24e−1 | 2.19e0 | 0.2354 | 0.3 | 1 |
+| smt | 25 710 | 3.34e−3 | 3.92e2 | 3.152 | 4 | 1 |
+| thermomech_TK | 102 158 | ≈0（刚体模态） | 6.95e−1 | 0.1327 | 0.2 | 1 |
+| thermomech_dK | 204 316 | 计算中 | | | | |
+| boneS10 | 914 898 | 计算中 | | | | |
+
+说明：
+- 目前 5 个矩阵的谱量纲都正常，**没有触发 α 缩放**（α=1）；缩放机制保留供 dK/boneS10 使用。
+- thermomech_dK 的 mtx 是 `general` 全存储（上下三角各一份，相对偏差 1.8e-16），
+  脚本按 `(A+Aᵀ)/2` 平均对称化；若误用 `A+Aᵀ−diag` 会使谱整体放大 2 倍。
+- bcsstk13 参考解已与稠密 `eigvalsh` 交叉验证（前 200 阶最大相对误差 5.4e-10）。

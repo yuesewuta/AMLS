@@ -102,6 +102,18 @@ public:
     /// 调用方以 DAG 依赖序保证此刻无人再读节点 i 的块。
     void shrinkNodeData(int64_t i, bool releaseFactor) const;
 
+    // ---- Mtemp（W = K̂⁻¹M̂）复用接口（供子空间缩聚）----
+    /// 缩聚右投影（式 16/17a）对 Mtemp 的复用：K̂⁻¹(M̂·Z) = (K̂⁻¹M̂)·Z
+    /// = W·Z（结合律，同 makeWX 的 T3）。返回节点 i 缓存的 W；未物化/
+    /// 已释放返回 nullptr，调用方回退 solveFactor 回代。仅统一 DAG 路径
+    /// 可用（ElimData 存活且 W 未释放）；旧路径恒为 nullptr。
+    const DenseMatrix* nodeW(int64_t i) const;
+    /// 统一 DAG 路径下 W 的释放移交给缩聚（f 用完才放）：置位后 GE 的
+    /// DONE/relW 不再释放 d.W，由 cond.rel(i) 调 releaseNodeW。
+    void deferWRelease() const { wReleaseDeferred_ = true; }
+    /// cond.rel(i) 调用：缩聚已用完节点 i 的 W（rel 排在 f(i) 之后）。
+    void releaseNodeW(int64_t i) const;
+
     // ---- 融合流水线（GE + 谱 + 投影逐层交织，releaseNode 及时释放）----
     int64_t maxLevel() const { return maxLevel_; }
     const std::vector<int64_t>& levelNodes(int64_t l) const {
@@ -254,20 +266,33 @@ private:
     struct ElimData {
         std::vector<int64_t> anc;
         DenseMatrix W;
-        std::unordered_map<int64_t, DenseMatrix> X, Y;
-        // X_a / Y_a 的非零列（a 空间）：右端零列经可逆回代保持零，
-        // 只需解这些列；下游 W·X 等同列跳过。缺省 = 全零解。
-        std::unordered_map<int64_t, std::vector<int32_t>> xCols, yCols;
-        // M̂·X 再回代的缓存（C 任务产物；DAG 路径下 D/E 任务直接取，
+        // 约束量 Ψ = K̂_ii⁻¹·K_{i,a} / K̂_ii⁻¹·M_{i,a}：右端零列经可逆
+        // 回代保持零 ⇒ 全程列压缩存储（cols = a 空间非零列，data 窄存
+        // n_i×c_a）；下游 Schur/同余算子按交集列跳过零列（dgemm n 维
+        // 缩小）。缺省 = 空表（全零解）。ident 恒 false。
+        std::unordered_map<int64_t, ColComp> X, Y;
+        // (K̂⁻¹M̂)·X_a 的窄存缓存（C 任务产物；DAG 路径下 E 任务直接取，
         // 不做 makeWX 的重复计算）。键 = 祖先 a。DAG 路径下多任务并发
         // 读写——建图阶段预填全部键（nullopt），任务阶段不触发结构变更。
-        std::unordered_map<int64_t, std::optional<DenseMatrix>> WX;
+        std::unordered_map<int64_t, std::optional<ColComp>> WX;
+        // Mtemp = W̃ = K̂⁻¹M̂（n_i×n_i）：节点级惰性物化（makeWX 首次
+        // 需要时一次宽回代），之后 WX_a = W̃·X_a（gemm，免逐次回代），
+        // 缩聚 f 的 WMz = W̃·Z_i（式 16/17a）复用同一份。per 祖先 C 任务
+        // 无相互依赖可并发首次进入——物化经 wMut 互斥、happens-before
+        // 后锁外读。wTransformed 一旦为真 d.W 不再被写。
+        bool wTransformed = false;
+        std::mutex wMut;
         // 释放互斥：unordered_map 的 erase 会改写桶链，同桶并发 erase
         // （relX(u)/relX(u') 同 prio 同就绪、clear+erase 交叉）会竞争前驱
         // 指针 → 堆破坏（46k/12 线程随机 AV 的根因）。erase/clear 统一走锁；
         // 值的读写（B 写 X[a]、D/E 读）不触结构，无需锁。
         std::mutex relMut;
     };
+
+    // DAG 运行期数据段（buildDag 预建，跨 GE/缩聚两阶段存活：
+    // 缩聚 f 经 nodeW 复用 W 需要 ElimData 在 DAG 跑完后仍可达）。
+    std::vector<std::shared_ptr<ElimData>> dagData_;
+    mutable bool wReleaseDeferred_ = false;   // 统一 DAG：W 释放移交 cond.rel(i)
     /// F 任务：K̂_ii 因式分解 + M̂_ii 缓存（d.W）。根节点此后无事。
     void factorNode_(int64_t i, ElimData& d);
     /// B 任务（per 祖先 a）：X_a / Y_a 回代（式 7a/8a 约束量）。
@@ -276,7 +301,7 @@ private:
     void solveXY_(int64_t i, ElimData& d);
     /// C 任务：WX_a = K̂_ii⁻¹(M̂_ii·X_a)（式 8c/7c，T3 结合律；
     /// 已算过则直接取缓存）。需 X_a 与其非零列表（B 之后）。
-    const DenseMatrix& makeWX_(int64_t i, ElimData& d, int64_t a) const;
+    const ColComp& makeWX_(int64_t i, ElimData& d, int64_t a) const;
     /// D/E 任务体（旧路径 applyNodeB_ 的循环体原样抽出，
     /// 含条带锁与 phaseProf 计时；不含 timing_ 段计时）。
     void schurKDiagTask_(int64_t i, ElimData& d, int64_t a, bool leaf);

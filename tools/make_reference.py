@@ -55,17 +55,36 @@ def find_mtx(mtx_dir: Path, name: str) -> Path:
     return hits[0]
 
 
+def header_is_symmetric(path: Path) -> bool:
+    """读 MatrixMarket banner,判断是否为对称(仅三角)存储。"""
+    with open(path, "r", errors="replace") as f:
+        banner = f.readline().lower()
+    return banner.startswith("%%matrixmarket") and "symmetric" in banner
+
+
 def load_stiffness(path: Path):
-    """读入 mtx,取上三角对称化,返回 CSR。"""
+    """读入刚度矩阵 mtx 并对称化,返回 CSR。
+
+    - symmetric 头:只存三角,scipy 自动镜像补齐。
+    - general 头:可能是全存储的对称矩阵(如 thermomech_dK,上下三角各存一份,
+      二者有 <=1e-4 的装配舍入差)。此时必须 (A+Aᵀ)/2 平均;若用 A+Aᵀ-diag
+      会把所有非对角元翻倍,谱整体放大 2 倍。
+    """
     print(f"  读入 {path} ...", flush=True)
-    A = sio.mmread(str(path))
-    A = sp.csr_matrix(A)
-    # mtx 中可能只存了上/下三角
-    if (A != A.T).nnz != 0:
+    A = sp.csr_matrix(sio.mmread(str(path)))
+    if not header_is_symmetric(path):
+        scale = float(abs(A).max()) or 1.0
+        asym = float(abs(A - A.T).max()) / scale
+        if asym > 1e-6:
+            sys.exit(f"{path.name}: general 存储但数值不对称(相对偏差 {asym:.2e}),"
+                     "请人工确认该矩阵是否为刚度矩阵")
+        print(f"  general 全存储,数值对称(相对偏差 {asym:.2e}),取 (A+Aᵀ)/2",
+              flush=True)
+        A = (A + A.T) * 0.5
+    elif (A != A.T).nnz:
         A = A + A.T - sp.diags(A.diagonal())
-    A = sp.csr_matrix(A)
     A.eliminate_zeros()
-    return A
+    return sp.csr_matrix(A)
 
 
 def write_bin(path: Path, A: sp.csr_matrix) -> None:
@@ -85,7 +104,12 @@ def write_bin(path: Path, A: sp.csr_matrix) -> None:
 
 
 def solve_reference(A):
-    """求前 NEV 阶最小特征值 mu(K x = mu x)。n<=13 万用移位反演,更大用 which='SA'。"""
+    """求前 NEV 阶最小特征值 mu(K x = mu x)。
+
+    - n <= 13 万: splu 精确移位反演 + ARPACK;
+    - 更大矩阵: LOBPCG + PyAMG 代数多重网格预条件(低内存;直接 LU 对 3D
+      刚度矩阵 fill-in 过大,纯 ARPACK which='SA' 对内特征值收敛过慢)。
+    """
     n = A.shape[0]
     t0 = time.time()
     if n <= 130_000:
@@ -102,7 +126,7 @@ def solve_reference(A):
             print(f"  移位反演失败({e!r}),改用 which='SA' ...", flush=True)
             mu = _sa(A)
     else:
-        mu = _sa(A)
+        mu = _lobpcg_amg(A)
     mu = np.sort(np.real(mu))
     print(f"  求解完成,{time.time()-t0:.1f}s,mu 范围 [{mu[0]:.3e}, {mu[-1]:.3e}]",
           flush=True)
@@ -115,6 +139,45 @@ def _sa(A):
     mu = eigsh(A, k=NEV, which="SA", tol=1e-8, ncv=min(n, max(4 * NEV, 800)),
                maxiter=10 * n, v0=v0, return_eigenvectors=False)
     return np.sort(np.real(mu))
+
+
+def _lobpcg_amg(A):
+    """LOBPCG + smoothed-aggregation AMG 求最小 NEV 阶(多取 16 阶保证第 200 阶质量)。"""
+    from scipy.sparse.linalg import lobpcg
+    try:
+        import pyamg
+    except ImportError:
+        sys.exit("大矩阵参考解需要 PyAMG:pip install pyamg(否则退回极慢的 which='SA')")
+
+    n = A.shape[0]
+    k = NEV + 16
+    scale = max(float(np.max(np.abs(A.diagonal()))), 1.0)
+    sigma = -1e-8 * scale  # 预条件用 K - sigma*I,半正定时也保证 SPD
+    print(f"  构建 AMG 层级 (n={n}, nnz={A.nnz}) ...", flush=True)
+    t0 = time.time()
+    ml = pyamg.smoothed_aggregation_solver(
+        (A - sigma * sp.identity(n, format="csc")).tocsr(),
+        max_coarse=500, max_levels=12)
+    print(f"  AMG 完成,{time.time()-t0:.1f}s,{len(ml.levels)} 层;开始 LOBPCG(k={k}) ...",
+          flush=True)
+
+    rng = np.random.default_rng(20261005)
+    X = rng.standard_normal((n, k))
+    # 预光滑初始空间(逐列,pyamg solve 只接受一维右端),显著加速收敛
+    for j in range(k):
+        X[:, j] = ml.solve(X[:, j], tol=1e-6, maxiter=3)
+    X, _ = np.linalg.qr(X)
+    def precond(B):
+        out = np.empty_like(B)
+        for j in range(B.shape[1]):
+            out[:, j] = ml.solve(B[:, j], tol=1e-8, maxiter=2)
+        return out
+    M = LinearOperator(A.shape, matvec=precond, matmat=precond, dtype=A.dtype)
+    t0 = time.time()
+    w, _ = lobpcg(A, X, B=None, M=M, largest=False, tol=1e-9, maxiter=400,
+                  retLambdaHistory=False)
+    print(f"  LOBPCG 完成,{time.time()-t0:.1f}s", flush=True)
+    return np.sort(np.real(w))[:NEV]
 
 
 def f_of(lam):
@@ -138,7 +201,21 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     names = [args.only] if args.only else MATRICES
+    csv_path = root / "f_user.csv"
+    header = ["matrix", "n", "nnz", "mass_scale_alpha",
+              "lambda_200", "f200_Hz", "f_user_Hz"]
     rows = []
+
+    def write_csv():
+        # 每算完一个矩阵就增量落盘,避免大矩阵中断丢失已完成结果
+        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(header)
+            for r in rows:
+                w.writerow([r["name"], r["n"], r["nnz"], r["alpha"],
+                            f"{r['lam200']:.6e}", f"{r['f200']:.6e}",
+                            f"{r['f_user']:g}"])
+
     for name in names:
         print(f"[{name}]", flush=True)
         npz_path = ref_dir / f"{name}_ref{NEV}.npz"
@@ -150,6 +227,7 @@ def main():
                                  lam200=float(z["lam"][-1]),
                                  f200=float(z["f"][-1]),
                                  f_user=float(z["f_user"])))
+            write_csv()
             continue
 
         mtx = find_mtx(mtx_dir, name)
@@ -172,20 +250,13 @@ def main():
             npz_path, n=n, nnz=nnz, alpha=alpha, mu=mu, lam=lam, f=f,
             f_user=fu)
         write_bin(bin_dir / f"{name}.bin", A)
-        print(f"  f200 = {f200:.6g} Hz -> f_user = {fu:.0f} Hz", flush=True)
+        print(f"  f200 = {f200:.6g} Hz -> f_user = {fu:g} Hz", flush=True)
         rows.append(dict(name=name, n=n, nnz=nnz, alpha=alpha,
                          lam200=float(lam[-1]), f200=f200, f_user=fu))
+        write_csv()
         del A
 
-    with open(root / "f_user.csv", "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["matrix", "n", "nnz", "mass_scale_alpha",
-                    "lambda_200", "f200_Hz", "f_user_Hz"])
-        for r in rows:
-            w.writerow([r["name"], r["n"], r["nnz"], r["alpha"],
-                        f"{r['lam200']:.6e}", f"{r['f200']:.6e}",
-                        f"{r['f_user']:.0f}"])
-    print(f"\n汇总写入 {root/'f_user.csv'}")
+    print(f"\n汇总写入 {csv_path}")
 
 
 if __name__ == "__main__":
