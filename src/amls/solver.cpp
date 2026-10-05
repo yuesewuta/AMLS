@@ -193,19 +193,25 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
             out = cond.run(tr, threads);
             return;
         }
-        // DAG 路径（effThreads>1）：GE 全树节点内子任务 DAG（无层 barrier，
-        // 跨层并行）；缩聚仍走整体两阶段（内部层并行），完成后再释放 GE
-        // 动态块（keepFactors 除外）。GE 可确定性重跑，趟 B 重跑安全。
+        // 统一 DAG 路径（effThreads>1）：GE 节点内子任务 + 缩聚
+        // SPEC/f/g/h/rel 全部进同一 DagRunner——消去与缩聚跨阶段重叠
+        // （子树消去完成即可局部谱+投影），块内存随 rel(i) 边算边放，
+        // 500k 规模常驻块不再堆积。rel 只缩数据不删表项（桶链并发安全）。
         const int effThreads =
             threads > 0 ? threads
                         : static_cast<int>(std::thread::hardware_concurrency());
         if (effThreads > 1) {
             ge.resetBlocks();
-            ge.runDag(effThreads);
-            out = cond.run(tr, threads);
-            if (!keepFactors)
-                for (int64_t i = 0; i < nTreeNodes; ++i)
-                    ge.releaseNode(i);
+            cond.beginPass();
+            DagRunner dag(effThreads);
+            GaussianElimination::GeDagTasks geInfo;
+            ge.buildDag(dag, geInfo);
+            cond.buildDag(dag, out, tr, geInfo, !keepFactors);
+            for (int64_t i = 0; i < nTreeNodes; ++i)
+                if (tree.node(i).children.empty())
+                    dag.ready(*geInfo.f[static_cast<size_t>(i)]);
+            dag.waitIdle();
+            cond.finalize(out);
             return;
         }
         cond.beginPass();

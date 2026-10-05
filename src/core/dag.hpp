@@ -114,9 +114,10 @@ private:
                     return;
                 t = ready_.top();
                 ready_.pop();
-                // 空闸：弹出后队列空 → 本任务允许申请 BLAS MT 预算
-                //（maybeBudget 内部另有全局互斥，防多个大任务同时放开）。
-                blas::tls_starved = ready_.empty();
+                // 空闸：弹出后队列空 且 在跑任务 ≤2（叶子波期间队列常瞬间
+                // 空但 12 worker 全忙——那种时刻放开 MT 只会互相踩踏）。
+                ++running_;
+                blas::tls_starved = ready_.empty() && running_ <= 2;
             }
             if (!failed_.load(std::memory_order_relaxed)) {
                 try {
@@ -133,6 +134,7 @@ private:
             }
             {
                 std::lock_guard<std::mutex> lk(qm_);
+                --running_;
                 if (--pending_ == 0)
                     qc_.notify_all();
             }
@@ -146,6 +148,7 @@ private:
     std::exception_ptr firstEx_;
     std::atomic<bool> failed_{false};
     int64_t pending_ = 0;
+    int64_t running_ = 0;   // 正在执行的任务数（空闸判断用，qm_ 保护）
     int64_t nextSeq_ = 0;
     bool stop_ = false;
     std::vector<std::thread> workers_;

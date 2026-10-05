@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -869,6 +870,24 @@ void GaussianElimination::runDag(int numThreads) {
     using Clock = std::chrono::steady_clock;
     const auto tg0 = Clock::now();
     DagRunner dag(numThreads);
+    GeDagTasks info;
+    buildDag(dag, info);
+    for (const int64_t i : order_)
+        if (tree_.node(i).children.empty())
+            dag.ready(*info.f[static_cast<size_t>(i)]);
+    dag.waitIdle();
+
+    const double dt = std::chrono::duration<double>(Clock::now() - tg0).count();
+    {
+        std::lock_guard<std::mutex> lk(statsMutex_);
+        timing_["par.total"] += dt;
+        timing_["dag.total"] = dt;
+    }
+}
+
+void GaussianElimination::buildDag(DagRunner& dag, GeDagTasks& out) {
+    out.f.assign(static_cast<size_t>(N_), nullptr);
+    out.done.assign(static_cast<size_t>(N_), nullptr);
 
     // ---- 节点任务句柄（后序建图：孩子先于父）----
     struct NodeTasks {
@@ -921,6 +940,9 @@ void GaussianElimination::runDag(int numThreads) {
         t.F = &dag.emplace([this, i, d, ni, lv] {
             trace::Scope s("ge", "F", i);
             if (trace::enabled()) { s.e.aux = ni; s.e.aux2 = lv; }
+            if (std::getenv("AMLS_DUMP_K"))
+                std::fprintf(stderr, "[dumpge] F i=%lld runs\n",
+                             static_cast<long long>(i));
             factorNode_(i, *d);
             if (stats)
                 recordNodeStat_(i);
@@ -1011,17 +1033,31 @@ void GaussianElimination::runDag(int numThreads) {
         for (int64_t u = 0; u < A; ++u) {
             const int64_t a = anc[static_cast<size_t>(u)];
             t.relX[static_cast<size_t>(u)] =
-                &dag.emplace([d, a] { d->X.erase(a); });
+                &dag.emplace([d, a] {
+                    std::lock_guard<std::mutex> lk(d->relMut);
+                    d->X.erase(a);
+                });
             t.relX[static_cast<size_t>(u)]->prio = pr + 5;   // phase 5
             t.relY[static_cast<size_t>(u)] =
-                &dag.emplace([d, a] { d->Y.erase(a); });
+                &dag.emplace([d, a] {
+                    std::lock_guard<std::mutex> lk(d->relMut);
+                    d->Y.erase(a);
+                });
             t.relY[static_cast<size_t>(u)]->prio = pr + 5;
             t.relWX[static_cast<size_t>(u)] =
-                &dag.emplace([d, a] { d->WX.erase(a); });
+                &dag.emplace([d, a] {
+                    std::lock_guard<std::mutex> lk(d->relMut);
+                    d->WX.erase(a);
+                });
             t.relWX[static_cast<size_t>(u)]->prio = pr + 5;
         }
         t.relW = &dag.emplace([d] { d->W.resize(0, 0); });
         t.relW->prio = pr + 5;
+        // 根节点 A=0 时下方循环全空 → relW 无依赖、又不是 ready 种子
+        //（solver 只 ready 叶子 F）→ 悬挂；而 DONE 无条件等 relW，连带
+        // done(根) 悬挂 → spec(根) 永不执行（res.k[根]=0，path:800 实测
+        // p 少 1）。补 relW ← F：W 是 F 分解的产物缓存，F 后释放即安全。
+        dag.depend(*t.relW, *t.F);
         for (int64_t u = 0; u < A; ++u) {
             auto& rX = *t.relX[static_cast<size_t>(u)];
             auto& rY = *t.relY[static_cast<size_t>(u)];
@@ -1057,12 +1093,21 @@ void GaussianElimination::runDag(int numThreads) {
                 sparseFactors_[static_cast<size_t>(i)].reset();
                 denseFactors_[static_cast<size_t>(i)].reset();
             }
-            d->X.clear();
-            d->Y.clear();
-            d->WX.clear();
+            {
+                std::lock_guard<std::mutex> lk(d->relMut);
+                d->X.clear();
+                d->Y.clear();
+                d->WX.clear();
+            }
             d->W.resize(0, 0);
         });
         t.done->prio = pr + 6;   // phase 6
+        // 根节点 A=0 时上面循环全空 → done 无任何依赖，而 DagRunner
+        // 只从显式 ready 的种子出发（solver ready 叶子 F），无依赖的
+        // done 永远不会触发——统一 DAG 里 spec(root) 等不到 done(root)，
+        // res.k[root] 停留初始 0（path:800 实测 p 少 1、根模态丢失）。
+        // 补 done ← F：对 A>0 是冗余边（D/E 传递已等 F），对根是救活链。
+        dag.depend(*t.done, *t.F);
         for (int64_t u = 0; u < A; ++u) {
             dag.depend(*t.done, *t.Dd[static_cast<size_t>(u)]);
             dag.depend(*t.done, *t.Ed[static_cast<size_t>(u)]);
@@ -1071,19 +1116,22 @@ void GaussianElimination::runDag(int numThreads) {
             dag.depend(*t.done, *t.Dc[static_cast<size_t>(pi2)]);
             dag.depend(*t.done, *t.Ec[static_cast<size_t>(pi2)]);
         }
+        // DONE 与 relX/relY/relWX/relW 之间无数据依赖边但共享 d->X/Y/WX/W：
+        // 二者常在同一完成事件后同时就绪，被不同 worker 并行弹出 →
+        // erase/clear/resize 并发改同一 unordered_map → 堆破坏（随机 AV，
+        // 46k/12 线程 ~40% 复现）。显式补序：释放任务先于 DONE。
+        for (int64_t u = 0; u < A; ++u) {
+            dag.depend(*t.done, *t.relX[static_cast<size_t>(u)]);
+            dag.depend(*t.done, *t.relY[static_cast<size_t>(u)]);
+            dag.depend(*t.done, *t.relWX[static_cast<size_t>(u)]);
+        }
+        dag.depend(*t.done, *t.relW);
     }
 
-    // ---- 入队叶子；其余任务由完成事件推进 ----
-    for (const int64_t i : order_)
-        if (tree_.node(i).children.empty())
-            dag.ready(*nt[static_cast<size_t>(i)].F);
-    dag.waitIdle();
-
-    const double dt = std::chrono::duration<double>(Clock::now() - tg0).count();
-    {
-        std::lock_guard<std::mutex> lk(statsMutex_);
-        timing_["par.total"] += dt;
-        timing_["dag.total"] = dt;
+    // ---- 输出任务句柄（ready/waitIdle 由调用方负责）----
+    for (const int64_t i : order_) {
+        out.f[static_cast<size_t>(i)] = nt[static_cast<size_t>(i)].F;
+        out.done[static_cast<size_t>(i)] = nt[static_cast<size_t>(i)].done;
     }
 }
 
@@ -1095,6 +1143,33 @@ void GaussianElimination::releaseNode(int64_t i) {
         const int64_t k = key_(a, i);
         kCoupD_.erase(k);
         mCoupD_.erase(k);
+    }
+}
+
+void GaussianElimination::shrinkNodeData(int64_t i, bool releaseFactor) const {
+    // 与 releaseNode 不同：不 erase 表项（桶链不动，可与运行期无锁 find
+    // 并发），只把已存在表项的稠密数据清零释放。调用方保证此刻无人再
+    // 读节点 i 的块（DAG 依赖序）；其它线程的 find 可能查到这些空壳，
+    // 但按依赖设计不会使用。
+    static auto shrink = [](ColComp& blk) {
+        blk.data.resize(0, 0);
+        blk.cols.clear();
+        blk.ident = false;
+    };
+    if (auto it = kDiag_.find(i); it != kDiag_.end())
+        shrink(it->second);
+    if (auto it = mDiag_.find(i); it != mDiag_.end())
+        shrink(it->second);
+    for (int64_t a : tree_.ancestors(i)) {
+        const int64_t k = key_(a, i);
+        if (auto it = kCoupD_.find(k); it != kCoupD_.end())
+            shrink(it->second);
+        if (auto it = mCoupD_.find(k); it != mCoupD_.end())
+            shrink(it->second);
+    }
+    if (releaseFactor) {
+        sparseFactors_[static_cast<size_t>(i)].reset();
+        denseFactors_[static_cast<size_t>(i)].reset();
     }
 }
 

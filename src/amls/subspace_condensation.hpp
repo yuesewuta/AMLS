@@ -66,6 +66,22 @@ public:
     Result run(const ISpectralTruncation<DefaultTraits>& truncation,
                int numThreads);
 
+    /// 统一 DAG：SPEC/f/g/h/rel 任务与 GE 任务进同一 runner（依赖边挂到
+    /// geInfo.done）。deps（静态过近似，过同步成本≈0——GE 内部边已把
+    /// geDone(kk) 排在 geDone(i) 之前）：
+    ///   SPEC(i) ← geDone(i)
+    ///   f(i)（右投影，写 mbar(a,i)）← SPEC(i)
+    ///   g(i)（中间列更新，读行 i 块、写祖先行块）← geDone(i), g(j) ∀j∈后代(i)
+    ///   h(i)（左投影 M̃，读行 i 块）← SPEC(i), g(j) ∀j∈后代(i)
+    ///   rel(i)（mbar 行释放 + ge_.shrinkNodeData）← f(i), g(i), h(i)
+    /// g 与 h 只读同一批行块、互不依赖（可并行）；行块释放等二者都完成。
+    /// 调用方负责：beginPass() → buildDag → ready GE 叶子 → waitIdle →
+    /// finalize(res)。releaseData=false 时（恢复向量）不做任何释放。
+    void buildDag(DagRunner& dag, Result& res,
+                  const ISpectralTruncation<DefaultTraits>& truncation,
+                  const GaussianElimination::GeDagTasks& geInfo,
+                  bool releaseData);
+
     // ---- 融合流水线 API（与 GE 逐层交织；solver 驱动）----
     /// 每趟调用一次：清空投影工作表。
     void beginPass();

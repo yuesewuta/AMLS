@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "amls/separator_tree.hpp"
+#include "core/dag.hpp"
 #include "core/types.hpp"
 #include "linalg/colcomp.hpp"
 #include "linalg/sparse_direct.hpp"
@@ -84,6 +85,22 @@ public:
     /// 节点内：F(分解) → B(X/Y 回代, per 祖先) → C(WX, per 祖先) /
     /// D(K Schur 更新) / E(M 同余更新) → DONE。写-写冲突仍由条带锁处理。
     void runDag(int numThreads);
+
+    // ---- 统一 DAG（GE + 缩聚同一 runner；供融合流水线调用）----
+    struct GeDagTasks {
+        std::vector<DagTask*> f;     // per 节点 F（图根）
+        std::vector<DagTask*> done;  // per 节点 DONE（缩聚挂边的锚点）
+    };
+    /// 只建图不运行：任务与依赖边全部 emplace 进外部 runner（不 ready）。
+    /// 缩聚任务建进同一 runner 后，由调用方 ready 全部叶子 F 并 waitIdle。
+    void buildDag(DagRunner& dag, GeDagTasks& out);
+
+    /// 只缩内存不删表项：节点 i 的 (a,i) 耦合块与 diag 块的稠密数据清零、
+    /// 可选释放因子。结构（桶链）不动——可与无锁 find 并发（不动桶链，
+    /// 只写已存在表项的值）；这是统一 DAG 内"边算边放"的正式释放路径，
+    /// 与 releaseNode（趟间全删、串行安全）互补。const：内部缓存语义，
+    /// 调用方以 DAG 依赖序保证此刻无人再读节点 i 的块。
+    void shrinkNodeData(int64_t i, bool releaseFactor) const;
 
     // ---- 融合流水线（GE + 谱 + 投影逐层交织，releaseNode 及时释放）----
     int64_t maxLevel() const { return maxLevel_; }
@@ -202,9 +219,11 @@ private:
     std::unordered_map<int64_t, SparseMatrix> origKCoup_, origMCoup_;
 
     // 消去过程动态块（列压缩；diag 为 ident 全表退化情形）
-    std::unordered_map<int64_t, ColComp> kDiag_;    // 分割节点 K̂_ii
+    // kDiag_/mDiag_ 也 mutable：统一 DAG 的 shrinkNodeData 在 const ge_
+    // 上按依赖序缩容（只动值不动结构）。
+    mutable std::unordered_map<int64_t, ColComp> kDiag_;    // 分割节点 K̂_ii
     mutable std::unordered_map<int64_t, ColComp> kCoupD_;  // (anc, lo) K 耦合
-    std::unordered_map<int64_t, ColComp> mDiag_;    // 分割节点 M̂_ii
+    mutable std::unordered_map<int64_t, ColComp> mDiag_;    // 分割节点 M̂_ii
     mutable std::unordered_map<int64_t, ColComp> mCoupD_;  // (anc, lo) M 耦合
     // 符号填充 pass 产物：各耦合块的终态列模式（= 出生表；诞生后即擦除
     // 以省内存）。消去 i 时 colK(hi,lo) |= rowK(lo,i)（K 更新列来自
@@ -214,10 +233,12 @@ private:
     // 符号 pass 漏列计数（诞生注入时原块列不在表中；预期恒 0）
     std::atomic<int64_t> nMiss_{0};
 
-    // 因子（恢复与缩聚右投影的块算子载体）
-    std::vector<std::unique_ptr<EigenSimplicialLDLTSolver<DefaultTraits>>>
+    // 因子（恢复与缩聚右投影的块算子载体）。mutable：shrinkNodeData 的
+    // 按依赖序释放（const 语义，同块表）。
+    mutable std::vector<std::unique_ptr<EigenSimplicialLDLTSolver<DefaultTraits>>>
         sparseFactors_;
-    std::vector<std::unique_ptr<DenseLDLTSolver<DefaultTraits>>> denseFactors_;
+    mutable std::vector<std::unique_ptr<DenseLDLTSolver<DefaultTraits>>>
+        denseFactors_;
 
     int64_t key_(int64_t hi, int64_t lo) const { return hi * N_ + lo; }
 
@@ -241,6 +262,11 @@ private:
         // 不做 makeWX 的重复计算）。键 = 祖先 a。DAG 路径下多任务并发
         // 读写——建图阶段预填全部键（nullopt），任务阶段不触发结构变更。
         std::unordered_map<int64_t, std::optional<DenseMatrix>> WX;
+        // 释放互斥：unordered_map 的 erase 会改写桶链，同桶并发 erase
+        // （relX(u)/relX(u') 同 prio 同就绪、clear+erase 交叉）会竞争前驱
+        // 指针 → 堆破坏（46k/12 线程随机 AV 的根因）。erase/clear 统一走锁；
+        // 值的读写（B 写 X[a]、D/E 读）不触结构，无需锁。
+        std::mutex relMut;
     };
     /// F 任务：K̂_ii 因式分解 + M̂_ii 缓存（d.W）。根节点此后无事。
     void factorNode_(int64_t i, ElimData& d);

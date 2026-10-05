@@ -16,3 +16,9 @@ papers/_txt/
 # 系统文件
 Thumbs.db
 .DS_Store
+
+# 基准数据(benchmark/matrices、bin、reference、results 不入库)
+benchmark/matrices/
+benchmark/bin/
+benchmark/reference/
+benchmark/results/

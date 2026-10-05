@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -124,6 +126,265 @@ void SubspaceCondensation::finalize(Result& res) {
         acc += res.k[static_cast<size_t>(i)];
     }
     res.p = acc;
+    if (std::getenv("AMLS_DUMP_K")) {
+        std::string line = "[dumpk]";
+        for (int64_t i = 0; i < N_; ++i) {
+            line += " i=" + std::to_string(i) + "(lv" +
+                    std::to_string(ge_.level(i)) + ",n" +
+                    std::to_string(ge_.size(i)) + ",k" +
+                    std::to_string(res.k[static_cast<size_t>(i)]) + ")";
+        }
+        std::fprintf(stderr, "%s p=%lld\n", line.c_str(),
+                     static_cast<long long>(res.p));
+    }
+}
+
+void SubspaceCondensation::buildDag(
+    DagRunner& dag, Result& res,
+    const ISpectralTruncation<DefaultTraits>& truncation,
+    const GaussianElimination::GeDagTasks& geInfo, bool releaseData) {
+    struct NodeTasks {
+        DagTask *spec = nullptr, *f = nullptr, *g = nullptr, *h = nullptr,
+               *rel = nullptr;
+    };
+    std::vector<NodeTasks> nt(static_cast<size_t>(N_));
+    const std::vector<int64_t>& order = ge_.postOrder();
+
+    // 优先级与 GE 同一节点主序：SPEC=rank*8+7，f=+8，g/h=+9，rel=+10。
+    std::vector<int64_t> rank(static_cast<size_t>(N_));
+    for (int64_t r = 0; r < static_cast<int64_t>(order.size()); ++r)
+        rank[static_cast<size_t>(order[static_cast<size_t>(r)])] = r;
+
+    // 静态后代表（依赖枚举）：g/h 需要"全部后代 j 的 f(j)/g(j) 完成"。
+    // 行块 (i,kk) 由 f(kk) 创建、g(中间节点) 累加定稿——过近似覆盖全集，
+    // 成本≈0：GE 内部边已把 geDone(kk) 排在 geDone(i) 前，COND 任务随挂随走。
+    std::vector<std::vector<int64_t>> descs(static_cast<size_t>(N_));
+    for (const int64_t i : order)
+        for (int64_t a : ge_.tree().ancestors(i))
+            descs[static_cast<size_t>(a)].push_back(i);
+
+    for (const int64_t i : order) {
+        const int64_t pr = rank[static_cast<size_t>(i)] * 8;
+        auto& t = nt[static_cast<size_t>(i)];
+
+        // ---- SPEC(i)：局部谱 + 截断选择（写 res.k/mu/Z）----
+        t.spec = &dag.emplace([this, &truncation, &res, i] {
+            trace::Scope s("cond", "SPEC", i);
+            if (trace::enabled())
+                s.e.aux2 = ge_.level(i);
+            const bool isLeaf = ge_.isLeaf(i);
+            // 特征求解覆盖输入 → 取副本
+            DenseMatrix Kh = isLeaf ? DenseMatrix(ge_.origKDiag(i))
+                                    : ge_.kDiag(i).data;
+            DenseMatrix Mh = isLeaf ? DenseMatrix(ge_.origMDiag(i))
+                                    : ge_.mDiag(i).data;
+            Vector w;
+            DenseMatrix v;
+            double rlo, rhi;
+            DefaultTraits::Index il, iu;
+            if (truncation.intervalHint(rlo, rhi))
+                eig_.solveLocalInterval(Kh, Mh, rlo, rhi, w, v);
+            else if (truncation.indexHint(il, iu))
+                eig_.solveLocalIndex(Kh, Mh, il, iu, w, v);
+            else
+                eig_.solveLocalAll(Kh, Mh, w, v);
+            // 截断选择（本节点独立）
+            const int64_t kmax = static_cast<int64_t>(w.size());
+            const int64_t ki = truncation.select(w, kmax);
+            if (std::getenv("AMLS_DUMP_K") && !isLeaf) {
+                std::fprintf(stderr,
+                             "[dumpspec] i=%lld lv=%lld n=%lld Kh=%zux%zu "
+                             "Mh=%zux%zu kmax=%lld ki=%lld Kh00=%g Mh00=%g\n",
+                             static_cast<long long>(i),
+                             static_cast<long long>(ge_.level(i)),
+                             static_cast<long long>(ge_.size(i)),
+                             Kh.rows(), Kh.cols(), Mh.rows(), Mh.cols(),
+                             static_cast<long long>(kmax),
+                             static_cast<long long>(ki),
+                             Kh.rows() > 0 && Kh.cols() > 0 ? Kh(0, 0) : -1.0,
+                             Mh.rows() > 0 && Mh.cols() > 0 ? Mh(0, 0) : -1.0);
+            }
+            res.k[static_cast<size_t>(i)] = ki;
+            if (ki > 0) {
+                res.mu[static_cast<size_t>(i)] = w.head(ki);
+                res.Z[static_cast<size_t>(i)] = v.leftCols(ki);
+            }
+        });
+        t.spec->prio = pr + 7;
+        dag.depend(*t.spec, *geInfo.done[static_cast<size_t>(i)]);
+
+        // ---- f(i)：右投影初始化（式 16/17a；写 mbar(a,i) 行块）----
+        t.f = &dag.emplace([this, &res, i] {
+            if (res.k[static_cast<size_t>(i)] <= 0)
+                return;
+            trace::Scope s("cond", "PROJ.init", i);
+            if (trace::enabled()) {
+                s.e.aux = res.k[static_cast<size_t>(i)];
+                s.e.aux2 = ge_.level(i);
+            }
+            const bool isLeaf = ge_.isLeaf(i);
+            const auto& Zi = res.Z[static_cast<size_t>(i)];
+            DenseMatrix Mz = isLeaf ? DenseMatrix(ge_.origMDiag(i)) * Zi
+                                    : ge_.mDiag(i).data * Zi;
+            DenseMatrix WMz;
+            ge_.solveFactor(i, Mz, WMz);
+            for (int64_t a : ge_.tree().ancestors(i)) {
+                DenseMatrix proj;
+                if (isLeaf)
+                    proj = DenseMatrix(ge_.origMCoupling(a, i)) * Zi;
+                else
+                    ge_.ops().gemm(CblasNoTrans, CblasNoTrans, 1.0,
+                                   ge_.mCoupling(a, i), Zi, 0.0, proj);
+                if (isLeaf)
+                    proj.noalias() -=
+                        DenseMatrix(ge_.origKCoupling(a, i)) * WMz;
+                else
+                    ge_.ops().subMul(proj, ge_.kCoupling(a, i), WMz);
+                std::lock_guard<std::mutex> lk(mapMutex_);
+                mbar_.emplace(key_(a, i), std::move(proj));
+                mbarRow_[a].push_back(i);
+            }
+        });
+        t.f->prio = pr + 8;
+        dag.depend(*t.f, *t.spec);
+
+        // ---- g(i)：中间节点列更新（式 17c；读行 i 块、写祖先行块）----
+        t.g = &dag.emplace([this, i] {
+            trace::Scope s("cond", "PROJ.mid", i);
+            if (trace::enabled())
+                s.e.aux2 = ge_.level(i);
+            const std::vector<int64_t> anc = ge_.tree().ancestors(i);
+            if (anc.empty())
+                return;   // 根：同余更新无接收方
+            std::vector<int64_t> rowKK;
+            {
+                std::lock_guard<std::mutex> lk(mapMutex_);
+                const auto it = mbarRow_.find(i);
+                if (it != mbarRow_.end())
+                    rowKK = it->second;
+            }
+            if (rowKK.empty())
+                return;
+            if (trace::enabled())
+                s.e.aux = static_cast<int64_t>(rowKK.size());
+            const bool isLeaf = ge_.isLeaf(i);
+            const int64_t ni = ge_.size(i);
+            int64_t total = 0;
+            for (int64_t kk : rowKK) {
+                std::lock_guard<std::mutex> lk(mapMutex_);
+                total += mbar_.at(key_(i, kk)).cols();
+            }
+            DenseMatrix RHS(ni, total);
+            int64_t off = 0;
+            for (int64_t kk : rowKK) {
+                const DenseMatrix* b;
+                {
+                    std::lock_guard<std::mutex> lk(mapMutex_);
+                    b = &mbar_.at(key_(i, kk));
+                }
+                RHS.block(0, off, ni, b->cols()) = *b;
+                off += b->cols();
+            }
+            DenseMatrix Vs;
+            ge_.solveFactor(i, RHS, Vs);
+            // 块 (a,kk)：本任务独占（g 链串行化同块写入），查表加锁、算术解锁
+            off = 0;
+            for (int64_t kk : rowKK) {
+                int64_t kcols;
+                {
+                    std::lock_guard<std::mutex> lk(mapMutex_);
+                    kcols = mbar_.at(key_(i, kk)).cols();
+                }
+                for (int64_t a : anc) {
+                    DenseMatrix* tgt;
+                    {
+                        std::lock_guard<std::mutex> lk(mapMutex_);
+                        tgt = &mbar_.at(key_(a, kk));
+                    }
+                    if (isLeaf)
+                        ge_.ops().subMul(*tgt, ge_.origKCoupling(a, i),
+                                         Vs.block(0, off, ni, kcols));
+                    else
+                        ge_.ops().subMul(*tgt, ge_.kCoupling(a, i),
+                                         Vs.block(0, off, ni, kcols));
+                }
+                off += kcols;
+            }
+        });
+        t.g->prio = pr + 9;
+        dag.depend(*t.g, *geInfo.done[static_cast<size_t>(i)]);
+        for (int64_t j : descs[static_cast<size_t>(i)]) {
+            dag.depend(*t.g, *nt[static_cast<size_t>(j)].g);
+            dag.depend(*t.g, *nt[static_cast<size_t>(j)].f);
+        }
+
+        // ---- h(i)：左投影（式 17b；M̃_{i,kk} = Z_iᵀ·行块）----
+        t.h = &dag.emplace([this, &res, i] {
+            const int64_t ki = res.k[static_cast<size_t>(i)];
+            if (ki <= 0)
+                return;
+            trace::Scope s("cond", "PROJ.left", i);
+            if (trace::enabled())
+                s.e.aux2 = ge_.level(i);
+            std::vector<int64_t> rowKK;
+            {
+                std::lock_guard<std::mutex> lk(mapMutex_);
+                const auto it = mbarRow_.find(i);
+                if (it != mbarRow_.end())
+                    rowKK = it->second;
+            }
+            if (trace::enabled())
+                s.e.aux = static_cast<int64_t>(rowKK.size());
+            for (int64_t kk : rowKK) {
+                DenseMatrix* blk;
+                {
+                    std::lock_guard<std::mutex> lk(mapMutex_);
+                    blk = &mbar_.at(key_(i, kk));
+                }
+                DenseMatrix out;
+                blas::gemm0(CblasTrans, CblasNoTrans,
+                            res.Z[static_cast<size_t>(i)], *blk, out);
+                std::lock_guard<std::mutex> lk(outMutex_);
+                res.mprojBlocks.push_back({i, kk, std::move(out)});
+            }
+        });
+        t.h->prio = pr + 9;
+        dag.depend(*t.h, *t.spec);
+        for (int64_t j : descs[static_cast<size_t>(i)]) {
+            dag.depend(*t.h, *nt[static_cast<size_t>(j)].g);
+            dag.depend(*t.h, *nt[static_cast<size_t>(j)].f);
+        }
+
+        // ---- rel(i)：行块释放 + GE 数据缩容（f/g/h 之后）----
+        t.rel = &dag.emplace([this, &res, i, releaseData] {
+            trace::Scope s("cond", "REL", i);
+            std::vector<int64_t> rowKK;
+            {
+                std::lock_guard<std::mutex> lk(mapMutex_);
+                const auto it = mbarRow_.find(i);
+                if (it != mbarRow_.end())
+                    rowKK = it->second;
+            }
+            // mbar 投影中间块：恢复向量不需要，无条件释放。
+            {
+                std::lock_guard<std::mutex> lk(mapMutex_);
+                for (int64_t kk : rowKK)
+                    mbar_.erase(key_(i, kk));
+                mbarRow_.erase(i);
+            }
+            // GE 块（diag/耦合）与 Z：恢复向量时的 backtransform 仍需要
+            // （旧路径 if(!keepFactors) releaseNode 同理），只在
+            // releaseData（= !keepFactors）时缩容。
+            if (releaseData)
+                ge_.shrinkNodeData(i, true);
+            if (releaseData)
+                res.Z[static_cast<size_t>(i)].resize(0, 0);
+        });
+        t.rel->prio = pr + 10;
+        dag.depend(*t.rel, *t.f);
+        dag.depend(*t.rel, *t.g);
+        dag.depend(*t.rel, *t.h);
+    }
 }
 
 void SubspaceCondensation::projectNode_(int64_t i, Result& res) {

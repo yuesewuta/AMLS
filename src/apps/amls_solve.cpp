@@ -8,8 +8,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <string>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 #include "amls/solver.hpp"
 #include "core/logging.hpp"
@@ -165,5 +172,15 @@ int main(int argc, char** argv) {
             sol.Z.col(sol.Z.cols() - 1));
         std::cout << "# 残差: 第1阶=" << r1 << " 末阶=" << rn << "\n";
     }
+#ifdef _WIN32
+    // 进程峰值工作集（统一 DAG 内存验证的直接读数）
+    {
+        PROCESS_MEMORY_COUNTERS pmc{};
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+            std::cout << "# 内存: 峰值工作集=" << std::fixed
+                      << std::setprecision(2)
+                      << pmc.PeakWorkingSetSize / 1073741824.0 << "GB\n";
+    }
+#endif
     return 0;
 }

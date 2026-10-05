@@ -2,6 +2,7 @@
 // OpenBLAS CBLAS 封装（列主序 = Eigen 默认布局）。
 // 转置通过 CblasTrans/CblasNoTrans 标志“隐式”完成，不物化转置副本。
 #include <atomic>
+#include <cstdlib>
 
 #include <openblas/cblas.h>
 
@@ -82,7 +83,8 @@ struct ScopedBudget {
     bool active = false;
     int saved = 1;
     explicit ScopedBudget(int k) {
-        if (!tls_starved || k <= 1)
+        static const bool mtEnabled = std::getenv("AMLS_NO_MT") == nullptr;
+        if (!mtEnabled || !tls_starved || k <= 1)
             return;
         if (g_mtBudgetLock.test_and_set(std::memory_order_acquire))
             return;   // 已有别的任务持有 MT 预算，本次保持单线程
