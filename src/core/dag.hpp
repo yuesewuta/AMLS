@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "linalg/blas.hpp"
+#include "linalg/colcomp.hpp"
 
 namespace amls {
 
@@ -75,6 +76,42 @@ public:
         if (t.remaining.load(std::memory_order_acquire) == 0)
             pushLocked_(&t);
     }
+
+    // ---- 负载自适应：任务内并行度档位（只升不降）----
+    // 判定（在节点 DONE 任务里调用）：就绪队列空 且 活跃 worker ≤2
+    // （多数线程无事可做 = 负载不均衡）。连续 3 个节点判定成立 → 升一档。
+    // 档位映射任务内并行线程数 {1,2,4,8}。近根段就绪队列常年枯竭 +
+    // 右耦合大任务串行，正是该机制的触发区；一旦升档，后续 D/E 任务的
+    // 主 dgemm 按目标列分组并行（见 colcomp.hpp dgemmCols）。
+    static constexpr int kMaxLoadLevel = 3;
+    void noteNodeDone() {
+        static const bool disabled = std::getenv("AMLS_NO_ADAPT") != nullptr;
+        if (disabled) return;
+        bool starved;
+        {
+            std::lock_guard<std::mutex> lk(qm_);
+            starved = ready_.empty() && running_ <= 2;
+        }
+        if (!starved) {
+            starveStreak_.store(0, std::memory_order_relaxed);
+            return;
+        }
+        if (starveStreak_.fetch_add(1, std::memory_order_relaxed) + 1 < 3)
+            return;
+        starveStreak_.store(0, std::memory_order_relaxed);
+        int lv = loadLevel_.load(std::memory_order_relaxed);
+        while (lv < kMaxLoadLevel &&
+               !loadLevel_.compare_exchange_weak(
+                   lv, lv + 1, std::memory_order_acq_rel,
+                   std::memory_order_relaxed)) {
+        }
+    }
+    /// 当前任务内并行度（DAG worker 任务入口设置到 opsTlsThreads）。
+    int taskParallelism() const {
+        static const int kTbl[] = {1, 2, 4, 8};
+        return kTbl[std::min(loadLevel_.load(std::memory_order_relaxed),
+                             kMaxLoadLevel)];
+    }
     /// 等待全部任务完成（worker 保留，可继续建任务/入队）。
     /// 任一任务抛异常：记录首个、跳过其余，此处重抛——否则异常在线程
     /// 里直接 terminate 且无诊断输出（大规模算例排查时踩过）。
@@ -121,8 +158,11 @@ private:
             }
             if (!failed_.load(std::memory_order_relaxed)) {
                 try {
+                    opsTlsThreads() = taskParallelism();
                     t->fn();
+                    opsTlsThreads() = 1;
                 } catch (...) {
+                    opsTlsThreads() = 1;
                     if (!failed_.exchange(true))
                         firstEx_ = std::current_exception();
                     // 失败后续任务跳过，但依赖推进继续，否则死等
@@ -152,6 +192,8 @@ private:
     int64_t nextSeq_ = 0;
     bool stop_ = false;
     std::vector<std::thread> workers_;
+    std::atomic<int> starveStreak_{0};   // 连续饥饿节点计数
+    std::atomic<int> loadLevel_{0};      // 并行度档位（只升不降，0..3）
 };
 
 } // namespace amls

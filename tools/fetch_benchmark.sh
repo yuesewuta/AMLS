@@ -9,9 +9,9 @@
 #   ≈1万      HB/bcsstk18              11948     飞机结构刚度
 #   ≈5万      TKK/smt                  25710     晶体管热应力刚度
 #   ≈10万     Botonakis/thermomech_TK 102158     热固耦合刚度
-#   ≈50万     Botanakis/thermomech_dK 204316     热固耦合刚度(20万级,-collection 无 50 万档独立结构 K)
+#   ≈50万     Botonakis/thermomech_dK 204316     热固耦合刚度(20万级,组名 Botonakis,非 Botanakis)
 #   ≈100万    Oberwolfach/boneS10      914898    取 A 即刚度 K
-set -euo pipefail
+set -uo pipefail
 DIR="${1:-benchmark/matrices}"
 mkdir -p "$DIR"
 cd "$DIR"
@@ -22,10 +22,13 @@ fetch() {  # fetch <组> <名>
         echo "已有 $name,跳过"
         return
     fi
-    echo "下载 $group/$name ..."
-    curl -sL --retry 3 -o "$name.tar.gz" "https://sparse.tamu.edu/MM/$group/$name.tar.gz"
-    tar xzf "$name.tar.gz"
-    rm "$name.tar.gz"
+    for try in 1 2 3; do
+        echo "下载 $group/$name (第 $try 次) ..."
+        curl -fL --retry 3 -o "$name.tar.gz" "https://sparse.tamu.edu/MM/$group/$name.tar.gz" \
+            && tar xzf "$name.tar.gz" && rm -f "$name.tar.gz" && return
+        rm -f "$name.tar.gz"; sleep 2
+    done
+    echo "!! $group/$name 下载失败,继续其余矩阵" >&2
 }
 
 fetch HB bcsstk13
@@ -33,6 +36,6 @@ fetch Cylshell s1rmq4m1
 fetch HB bcsstk18
 fetch TKK smt
 fetch Botonakis thermomech_TK
-fetch Botanakis thermomech_dK
+fetch Botonakis thermomech_dK
 fetch Oberwolfach boneS10
-echo "完成: $(du -sh . | cut -f1),共 $(ls */*.mtx | wc -l) 个矩阵"
+echo "完成: $(du -sh . | cut -f1),共 $(find . -name '*.mtx' | wc -l) 个矩阵"

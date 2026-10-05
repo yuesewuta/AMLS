@@ -7,12 +7,12 @@
 
 | 目标规模 | 矩阵 | 阶数 n | 来源 | 备注 |
 |---|---|---|---|---|
-| ≈2千 | HB/bcsstk13 | 2 003 | https://sparse.tamu.edu/HB/bcsstk13 | Boeing 飞机结构刚度，**半正定（含刚体模态）** |
+| ≈2千 | HB/bcsstk13 | 2 003 | https://sparse.tamu.edu/HB/bcsstk13 | Boeing 飞机结构刚度（实测最小特征值 μ₁≈284>0，正定） |
 | ≈5千 | Cylshell/s1rmq4m1 | 5 489 | https://sparse.tamu.edu/Cylshell/s1rmq4m1 | 圆柱壳 FEM 刚度，正定 |
 | ≈1万 | HB/bcsstk18 | 11 948 | https://sparse.tamu.edu/HB/bcsstk18 | 飞机结构刚度 |
 | ≈5万 | TKK/smt | 25 710 | https://sparse.tamu.edu/TKK/smt | 晶体管热应力刚度 |
 | ≈10万 | Botonakis/thermomech_TK | 102 158 | https://sparse.tamu.edu/Botonakis/thermomech_TK | 热固耦合刚度 |
-| ≈50万 | Botanakis/thermomech_dK | 204 316 | https://sparse.tamu.edu/Botanakis/thermomech_dK | 热固耦合刚度（20 万级；SuiteSparse 无接近 50 万的独立结构 K） |
+| ≈50万 | Botonakis/thermomech_dK | 204 316 | https://sparse.tamu.edu/Botonakis/thermomech_dK | 热固耦合刚度（20 万级；SuiteSparse 无接近 50 万的独立结构 K；注意组名是 Botonakis） |
 | ≈100万 | Oberwolfach/boneS10 | 914 898 | https://sparse.tamu.edu/Oberwolfach/boneS10 | 取页面上的 A 即刚度 K |
 
 质量矩阵一律取单位阵（`amls_solve` 不传 `--M` 即自动 M = I）。
@@ -30,8 +30,9 @@ python tools/make_reference.py         # 2. 求前 200 阶参考解 + mtx→bin 
 
 ### 求解策略
 
-- n ≤ 130 000：`scipy.sparse.linalg.splu` 分解 + ARPACK 移位反演（sigma=0），可靠求最小 200 阶；
-  bcsstk13 的刚体模态（μ=0）也会被正确求出。
+- n ≤ 130 000：`scipy.sparse.linalg.splu` 分解 + ARPACK 移位反演（小负移位 σ=−1e-8·‖K‖，
+  即使矩阵半正定含刚体模态也能稳定分解），可靠求最小 200 阶；bcsstk13 已与稠密分解交叉验证
+  （前 200 阶最大相对误差 5.4e-10）。
 - n > 130 000（thermomech_dK、boneS10）：移位反演分解代价过高，直接 ARPACK `which='SA'`
   求**代数上**最小的 200 阶（含刚体模态时最低几阶为 0，结果一致）。
   大矩阵这一步可能需要数小时，属一次性成本。

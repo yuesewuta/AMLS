@@ -1085,7 +1085,7 @@ void GaussianElimination::buildDag(DagRunner& dag, GeDagTasks& out) {
         // 因子（数值上破坏缩聚投影，仅用于验证"452 个叶因子常驻 = 250k OOM"
         // 假设；正式解法是缩聚统一 DAG 内释放）。
         static const bool probeFreeFactors = std::getenv("AMLS_FREE_FACTORS") != nullptr;
-        t.done = &dag.emplace([this, d, i, lv, probeFreeFactors] {
+        t.done = &dag.emplace([this, d, i, lv, probeFreeFactors, &dag] {
             trace::Scope s("ge", "DONE", i);
             if (trace::enabled()) { s.e.aux2 = lv; }
             if (probeFreeFactors) {
@@ -1100,6 +1100,13 @@ void GaussianElimination::buildDag(DagRunner& dag, GeDagTasks& out) {
                 d->WX.clear();
             }
             d->W.resize(0, 0);
+            // 负载自适应：每完成一个节点判定一次饥饿（就绪空 + 活跃少），
+            // 连续 3 个节点成立则升任务内并行度档（只升不降）。
+            const int before = dag.taskParallelism();
+            dag.noteNodeDone();
+            const int after = dag.taskParallelism();
+            if (after > before)
+                trace::mark("dag", "loadlevel", after);
         });
         t.done->prio = pr + 6;   // phase 6
         // 根节点 A=0 时上面循环全空 → done 无任何依赖，而 DagRunner

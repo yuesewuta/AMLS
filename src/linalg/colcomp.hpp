@@ -14,13 +14,96 @@
 //     A 为接收块（压缩接收时积只在其存储列上计算，右端列按 A.cols 再收）。
 #include <algorithm>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 #include <openblas/cblas.h>
 
 #include "core/types.hpp"
+#include "linalg/blas.hpp"
 
 namespace amls {
+
+/// 算子层并行度（thread_local）：DagRunner 在每个任务入口按当前负载
+/// 档位设置，任务内的列分组并行 dgemm 读取它。任务中途升档不影响已
+/// 运行任务（入口快照）；不在 DAG worker 里的调用恒为 1（串行）。
+inline int& opsTlsThreads() {
+    static thread_local int v = 1;
+    return v;
+}
+
+/// 列分组并行 dgemm：C(:, jseg) = alpha·op(A)·op(B)(:, jseg) + beta·C(:,jseg)。
+/// 列主序下 op(B) 的任意列段都是连续内存（tb=NoTrans 取 B 的列段，
+/// tb=Trans 取 B 的行段 = 其列主序列），各线程写不相交列段，无竞争、
+/// 无锁、不依赖 BLAS 内部线程（规避 libgomp 嵌套并行区风险）。
+/// 纯内联 dgemm 调用级拆分，对调用方完全等价于单次 dgemm。
+inline void dgemmCols(CBLAS_TRANSPOSE ta, CBLAS_TRANSPOSE tb, double alpha,
+                      const DefaultTraits::DenseMatrix& A,
+                      const DefaultTraits::DenseMatrix& B, double beta,
+                      DefaultTraits::DenseMatrix& C, int nthreads) {
+    using Dense = DefaultTraits::DenseMatrix;
+    const int m = static_cast<int>((ta == CblasNoTrans) ? A.rows() : A.cols());
+    const int k = static_cast<int>((ta == CblasNoTrans) ? A.cols() : A.rows());
+    const int n = static_cast<int>((tb == CblasNoTrans) ? B.cols() : B.rows());
+    if (n <= 0 || m <= 0) return;
+    static const bool forceSerial = std::getenv("AMLS_DGEMM_SERIAL") != nullptr;
+    if (forceSerial) nthreads = 1;
+    nthreads = std::min<int>(nthreads, static_cast<int>((n + 31) / 32));
+    if (nthreads <= 1) {
+        cblas_dgemm(CblasColMajor, ta, tb, m, n, k, alpha, A.data(),
+                    static_cast<int>(A.rows()), B.data(),
+                    static_cast<int>(B.rows()), beta, C.data(),
+                    static_cast<int>(C.rows()));
+        return;
+    }
+    const int ldb = static_cast<int>(B.rows());
+    const int ldc = static_cast<int>(C.rows());
+    // 列段均分（余数摊给前几个线程）。
+    // tb=NoTrans: op(B) 列段 = B 的列 j0..（列主序连续，指针偏移即可）
+    // tb=Trans:   op(B) 列段 = B 的行 j0..（列主序下每列是 B 的一行、
+    //             行内步长 ldb 不连续）→ 线程内先物化成连续 k×jn 段
+    //             C 段 = Aᵀ·Bseg，即 dgemm(ta, NoTrans)。
+    auto runSeg = [&](int j0, int j1) {
+        if (j1 <= j0) return;
+        const int jn = j1 - j0;
+        blas::pinThisThread();   // 临时线程：OpenBLAS(OMP 版) ICV 钉 1，
+                                 // 否则每线程内 dgemm 再开满核 → 过度订阅
+        if (tb == CblasNoTrans) {
+            const double* bPtr = B.data() + static_cast<int64_t>(j0) * ldb;
+            double* cPtr = C.data() + static_cast<int64_t>(j0) * ldc;
+            cblas_dgemm(CblasColMajor, ta, tb, m, jn, k, alpha, A.data(),
+                        static_cast<int>(A.rows()), bPtr, ldb, beta, cPtr,
+                        ldc);
+            return;
+        }
+        // tb=Trans: op(B)=Bᵀ，op(B)(r, j0+c) = B(j0+c, r)（B 的第 j0+c 行），
+        // 列主序下行不连续 → 物化时行列对调：bSeg(r,c) = B(j0+c, r)。
+        Dense bSeg(k, jn);
+        for (int c = 0; c < jn; ++c)
+            for (int r = 0; r < k; ++r)
+                bSeg(r, c) = B(static_cast<int64_t>(j0) + c,
+                               static_cast<int64_t>(r));
+        double* cPtr = C.data() + static_cast<int64_t>(j0) * ldc;
+        cblas_dgemm(CblasColMajor, ta, CblasNoTrans, m, jn, k, alpha, A.data(),
+                    static_cast<int>(A.rows()), bSeg.data(), k, beta, cPtr,
+                    ldc);
+    };
+    std::vector<std::thread> ths;
+    ths.reserve(static_cast<size_t>(nthreads - 1));
+    const int64_t base = n / nthreads, extra = n % nthreads;
+    int64_t j = 0;
+    for (int t = 0; t < nthreads; ++t) {
+        const int64_t jn = base + (t < extra ? 1 : 0);
+        const int64_t j0 = j, j1 = j + jn;
+        j = j1;
+        if (t == nthreads - 1)
+            runSeg(j0, j1);
+        else
+            ths.emplace_back(runSeg, j0, j1);
+    }
+    for (auto& th : ths) th.join();
+    (void)sizeof(Dense);
+}
 
 /// 列压缩稠密块。
 struct ColComp {
@@ -310,19 +393,34 @@ public:
     /// subMul/addMul/subTransMul/addTransMul 的公共实现（trans 选择转置项）。
     /// 转置项统一用单次 dgemm(ta=Trans,tb=Trans) 直写目标：
     ///   A ±= (B·C)ᵀ = op(Cg)ᵀ·op(S)ᵀ，无中间乘积、无显式转置拷贝。
+    /// 负载自适应：DAG 饥饿升档后 opsTlsThreads()>1，主 dgemm 按目标列
+    /// 分组用临时线程并行（各线程写不相交列段，等价于单次 dgemm）。
+    static bool parWorthy(int64_t m, int64_t n, int64_t k) {
+        const int nt = opsTlsThreads();
+        return nt > 1 && n >= 2 * nt && 2.0 * m * n * k >= 2.0e8;
+    }
     static void accMul(ColComp& A, const ColComp& B, const Dense& C,
                        double sign, bool trans) {
         if (B.empty() || A.empty()) return;
         if (!trans) {
             if (A.ident) {
                 const Dense Cg = B.ident ? Dense(C) : rows(C, B.cols);
-                dgemm(CblasNoTrans, CblasNoTrans, sign, B.data, Cg, 1.0,
-                      A.data);
+                if (parWorthy(B.data.rows(), A.data.cols(), Cg.rows()))
+                    dgemmCols(CblasNoTrans, CblasNoTrans, sign, B.data, Cg,
+                              1.0, A.data, opsTlsThreads());
+                else
+                    dgemm(CblasNoTrans, CblasNoTrans, sign, B.data, Cg, 1.0,
+                          A.data);
                 return;
             }
             const Dense Cg =
                 B.ident ? colsOf(C, A.cols) : sub(C, B.cols, A.cols);  // (c_b×c_a)
-            dgemm(CblasNoTrans, CblasNoTrans, sign, B.data, Cg, 1.0, A.data);
+            if (parWorthy(B.data.rows(), A.data.cols(), Cg.rows()))
+                dgemmCols(CblasNoTrans, CblasNoTrans, sign, B.data, Cg, 1.0,
+                          A.data, opsTlsThreads());
+            else
+                dgemm(CblasNoTrans, CblasNoTrans, sign, B.data, Cg, 1.0,
+                      A.data);
             return;
         }
         // 转置项：A ±= (B·C)ᵀ。C 经 B.cols 行 gather（c_b×n_hi）；
@@ -330,11 +428,60 @@ public:
         const Dense Cg = B.ident ? Dense(C) : rows(C, B.cols);
         if (A.ident) {
             // 全尺寸：(B.data·Cg)ᵀ = Cgᵀ·B.dataᵀ，单次 dgemm 直写 A.data
-            dgemm(CblasTrans, CblasTrans, sign, Cg, B.data, 1.0, A.data);
+            if (parWorthy(Cg.cols(), A.data.cols(), Cg.rows()))
+                dgemmCols(CblasTrans, CblasTrans, sign, Cg, B.data, 1.0,
+                          A.data, opsTlsThreads());
+            else
+                dgemm(CblasTrans, CblasTrans, sign, Cg, B.data, 1.0, A.data);
             return;
         }
         // 压缩接收：列限制在 A.cols。S = B.data(A.cols, B.cols)（c_a×c_b），
         // (B·C)ᵀ(:,A.cols) = Cgᵀ·Sᵀ；B.ident 时 S 为 B.data 的 A.cols 行。
+        // 并行路径：S 按 A.cols 段分组，每线程独立 sub-gather + dgemm。
+        if (parWorthy(Cg.cols(), A.data.cols(), Cg.rows())) {
+            static const bool forceSerial =
+                std::getenv("AMLS_DGEMM_SERIAL") != nullptr;
+            const int nt = forceSerial ? 1 : std::min<int64_t>(
+                             opsTlsThreads(),
+                             (A.data.cols() + 31) / 32);
+            Dense& Ad = A.data;
+            const auto& aCols = A.cols;
+            const auto& bCols = B.cols;
+            const bool bIdent = B.ident;
+            const Dense& Bd = B.data;
+            auto runSeg = [&](int64_t j0, int64_t j1) {
+                if (j1 <= j0) return;
+                blas::pinThisThread();   // 同上：临时线程钉 BLAS 单线程
+                std::vector<int32_t> seg(aCols.begin() + j0,
+                                         aCols.begin() + j1);
+                const Dense S = bIdent ? rows(Bd, seg)
+                                       : sub(Bd, seg, bCols);
+                double* cPtr = Ad.data() + j0 * static_cast<int64_t>(Ad.rows());
+                cblas_dgemm(CblasColMajor, CblasTrans, CblasTrans,
+                            static_cast<int>(Cg.cols()),
+                            static_cast<int>(j1 - j0),
+                            static_cast<int>(Cg.rows()), sign, Cg.data(),
+                            static_cast<int>(Cg.rows()), S.data(),
+                            static_cast<int>(S.rows()), 1.0, cPtr,
+                            static_cast<int>(Ad.rows()));
+            };
+            std::vector<std::thread> ths;
+            ths.reserve(static_cast<size_t>(nt > 0 ? nt - 1 : 0));
+            const int64_t n = static_cast<int64_t>(aCols.size());
+            const int64_t base = n / nt, extra = n % nt;
+            int64_t j = 0;
+            for (int t = 0; t < nt; ++t) {
+                const int64_t jn = base + (t < extra ? 1 : 0);
+                const int64_t j0 = j, j1 = j + jn;
+                j = j1;
+                if (t == nt - 1)
+                    runSeg(j0, j1);
+                else
+                    ths.emplace_back(runSeg, j0, j1);
+            }
+            for (auto& th : ths) th.join();
+            return;
+        }
         const Dense S =
             B.ident ? rows(B.data, A.cols) : sub(B.data, A.cols, B.cols);
         dgemm(CblasTrans, CblasTrans, sign, Cg, S, 1.0, A.data);
