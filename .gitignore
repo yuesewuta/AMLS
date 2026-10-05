@@ -1,0 +1,18 @@
+# 构建产物
+build/
+debug/
+
+# 矩阵数据（通过 tools/fetch_matrices.sh 从 SuiteSparse 下载，不入库）
+tests/matrices/*
+!tests/matrices/README.md
+
+# 生成的中间数据
+ge_blocks.csv
+
+# 参考论文（版权原因不入库）
+papers/*.pdf
+papers/_txt/
+
+# 系统文件
+Thumbs.db
+.DS_Store
