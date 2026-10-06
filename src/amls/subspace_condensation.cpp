@@ -74,12 +74,13 @@ void SubspaceCondensation::solveLocalEigenproblem(
     // 截断选择（本节点独立）
     const int64_t kmax = static_cast<int64_t>(w.size());
     const int64_t ki = truncation.select(w, kmax);
-    if (std::getenv("AMLS_DUMP_K") && !leaf) {
+    if (std::getenv("AMLS_DUMP_K")) {
         std::fprintf(stderr,
-                     "[dumpspec] i=%lld lv=%lld n=%lld Kh=%zux%zu "
+                     "[dumpspec] i=%lld lv=%lld leaf=%d n=%lld Kh=%zux%zu "
                      "Mh=%zux%zu kmax=%lld ki=%lld Kh00=%g Mh00=%g\n",
                      static_cast<long long>(i),
                      static_cast<long long>(ge_.level(i)),
+                     static_cast<int>(leaf),
                      static_cast<long long>(ge_.size(i)),
                      Kh.rows(), Kh.cols(), Mh.rows(), Mh.cols(),
                      static_cast<long long>(kmax),

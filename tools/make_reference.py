@@ -42,6 +42,7 @@ MATRICES = [
     "smt",            # TKK,        25710
     "thermomech_TK",  # Botonakis, 102158
     "thermomech_dK",  # Botanakis, 204316
+    "af_shell3",      # Schenk_AFE, 504855
     "boneS10",        # Oberwolfach,914898
 ]
 
@@ -103,13 +104,38 @@ def write_bin(path: Path, A: sp.csr_matrix) -> None:
         f.write(data.tobytes())
 
 
+def split_decoupled(A):
+    """剥离解耦自由度(只有对角非零的行列)。
+
+    ARPACK/LOBPCG 都是单/块迭代法,对简并特征值只返回一份副本
+    (实测 bcsstk18 的 729 重 lambda=1 簇几乎全部丢失)。解耦自由度的
+    特征值可以解析给出 lambda = K_ii(M=I),先从矩阵里剥掉,迭代法只在
+    剩余耦合部分求,最后把解析值并回谱里,多重性才完整。
+    返回 (耦合子矩阵, 解析特征值数组)。
+    """
+    off = A - sp.diags(A.diagonal())
+    off.eliminate_zeros()
+    r_off = np.asarray(off.getnnz(axis=1)).ravel()
+    iso = np.where(r_off == 0)[0]
+    if iso.size == 0:
+        return A, np.array([])
+    keep = np.ones(A.shape[0], dtype=bool)
+    keep[iso] = False
+    vals = np.asarray(A.diagonal())[iso]
+    print(f"  剥离 {iso.size} 个解耦自由度(解析特征值 lambda=K_ii)",
+          flush=True)
+    return A[np.ix_(keep, keep)].tocsr(), vals
+
+
 def solve_reference(A):
     """求前 NEV 阶最小特征值 mu(K x = mu x)。
 
+    - 解耦自由度先剥离(见 split_decoupled),解析特征值最后并回;
     - n <= 13 万: splu 精确移位反演 + ARPACK;
     - 更大矩阵: LOBPCG + PyAMG 代数多重网格预条件(低内存;直接 LU 对 3D
       刚度矩阵 fill-in 过大,纯 ARPACK which='SA' 对内特征值收敛过慢)。
     """
+    A, isoVals = split_decoupled(A)
     n = A.shape[0]
     t0 = time.time()
     if n <= 130_000:
@@ -127,7 +153,7 @@ def solve_reference(A):
             mu = _sa(A)
     else:
         mu = _lobpcg_amg(A)
-    mu = np.sort(np.real(mu))
+    mu = np.sort(np.concatenate([np.real(mu), isoVals]))
     print(f"  求解完成,{time.time()-t0:.1f}s,mu 范围 [{mu[0]:.3e}, {mu[-1]:.3e}]",
           flush=True)
     return mu
@@ -234,6 +260,9 @@ def main():
         A = load_stiffness(mtx)
         n, nnz = A.shape[0], A.nnz
         mu = solve_reference(A)
+        if mu.size < NEV:
+            sys.exit(f"{name}: 合并解耦特征值后仍不足 {NEV} 阶")
+        mu = mu[:NEV]   # 前 NEV 阶(解耦解析值已并入并升序)
 
         # 质量缩放:alpha 取 10 的整数幂,把第 200 阶物理特征值拉回 1e4 量级
         lam200 = mu[-1]

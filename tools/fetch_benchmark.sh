@@ -9,8 +9,9 @@
 #   ≈1万      HB/bcsstk18              11948     飞机结构刚度
 #   ≈5万      TKK/smt                  25710     晶体管热应力刚度
 #   ≈10万     Botonakis/thermomech_TK 102158     热固耦合刚度
-#   ≈50万     Botonakis/thermomech_dK 204316     热固耦合刚度(20万级,组名 Botonakis,非 Botanakis)
-#   ≈100万    Oberwolfach/boneS10      914898    取 A 即刚度 K
+#   ≈20万     Botonakis/thermomech_dK 204316     热固耦合刚度(dK 装配,组名 Botonakis,非 Botanakis)
+#   ≈50万     Schenk_AFE/af_shell3    504855     汽车壳 FEM 刚度,SPD
+#   ≈100万    Oberwolfach/boneS10      914898    取 A 即刚度 K(附带真实质量阵 boneS10_M)
 set -uo pipefail
 DIR="${1:-benchmark/matrices}"
 mkdir -p "$DIR"
@@ -37,5 +38,6 @@ fetch HB bcsstk18
 fetch TKK smt
 fetch Botonakis thermomech_TK
 fetch Botonakis thermomech_dK
+fetch Schenk_AFE af_shell3
 fetch Oberwolfach boneS10
 echo "完成: $(du -sh . | cut -f1),共 $(find . -name '*.mtx' | wc -l) 个矩阵"

@@ -249,7 +249,12 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
     SubspaceCondensation::Result res;
     double lambdaCut = -1.0;
 
-    if (optN.fixedKeep > 0) {
+    if (optN.lambdaCut > 0.0) {
+        // f_user 模式：绝对特征值截断，单趟，保留全部 λ≤λ_cut 的模态
+        ThresholdTruncation<DefaultTraits> tr(optN.lambdaCut);
+        trace::mark("solver", "pass.cut", 0);
+        runFused(tr, res);
+    } else if (optN.fixedKeep > 0) {
         FixedCountTruncation<DefaultTraits> tr(optN.fixedKeep);
         trace::mark("solver", "pass.A", 0);
         runFused(tr, res);
@@ -318,7 +323,11 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
                   << "（P12 切换点；仍用稠密求解）\n";
 
     // ---- step3 降阶广义特征问题 ----
-    const int64_t want = std::min<int64_t>(optN.nev, res.reducedSize);
+    // f_user 模式输出全部截断内模态（p 个，约等于截止频率以下的模态总数）；
+    // nev 模式仍按 nev 输出。
+    const int64_t want = optN.lambdaCut > 0.0
+                             ? res.reducedSize
+                             : std::min<int64_t>(optN.nev, res.reducedSize);
     auto [eigenvalues, projectedVectors] = solveProjected(res, want);
     const auto t4 = Clock::now();
     sol.timing["reduced"] = seconds(t3, t4);

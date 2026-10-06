@@ -5,8 +5,9 @@
 读取 benchmark/results/<name>_amls.txt (每行 "序号 特征值",# 开头为注释)
 与 benchmark/reference/<name>_ref200.npz,输出逐阶特征值/频率相对误差及汇总。
 
-注意 run_benchmark.sh 传 M = I,AMLS 输出对应标准特征值 mu(K x = mu x),
-故这里与 npz 中的 mu 对比;alpha 缩放只影响物理频率 f_user,不影响该对比。
+对比对象为 npz 中的 lam(物理特征值 K x = lam * M x,M = alpha*I)。
+run_benchmark.sh 按 f_user.csv 的 alpha 传 --mass-scale,AMLS 求解的
+正是该物理问题,其输出特征值直接与 lam 对比(alpha=1 时 lam == mu)。
 
 用法: python tools/compare_reference.py [--dir benchmark] [矩阵名...]
 """
@@ -37,7 +38,8 @@ def main():
     ap.add_argument("--dir", default="benchmark")
     ap.add_argument("names", nargs="*",
                     default=["bcsstk13", "s1rmq4m1", "bcsstk18", "smt",
-                             "thermomech_TK", "thermomech_dK", "boneS10"])
+                             "thermomech_TK", "thermomech_dK", "af_shell3",
+                             "boneS10"])
     args = ap.parse_args()
     root = Path(args.dir)
 
@@ -50,7 +52,7 @@ def main():
             print(f"{name:<16}  缺少参考解或结果文件,跳过")
             continue
         z = np.load(ref_p)
-        lam_ref, f_ref = z["mu"], z["f"]
+        lam_ref, f_ref = z["lam"], z["f"]
         lam = load_amls(out_p)
         k = min(len(lam), len(lam_ref))
         # 刚体/近零模态用绝对误差保护;频率相对误差 ≈ 特征值相对误差的一半

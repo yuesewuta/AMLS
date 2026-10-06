@@ -31,6 +31,8 @@ struct Args {
     std::string caseType;      // "path" / "grid"
     int64_t caseN = 0, caseNy = 0;
     bool consistentMass = false;
+    double massScale = 1.0;    // M ← α·M（f_user 协议的质量缩放系数）
+    double fuserHz = 0.0;      // >0: 截止频率 f_user (Hz)，λ_cut = (2πf_user)²
     amls::AmlsOptions opt;
     std::string outFile;
 };
@@ -42,7 +44,8 @@ void usage() {
         "  amls_solve --case grid:NX,NY [选项]\n"
         "  amls_solve --K K.mtx [--M M.mtx] [选项]\n"
         "选项: --nev K --nlevels L --eta H --shift S --fixed-keep K0\n"
-        "      --leaf-size S --threads T --no-recover --quiet --out FILE\n";
+        "      --fuser F(Hz) --mass-scale A --leaf-size S --threads T\n"
+        "      --no-recover --quiet --out FILE\n";
     std::exit(2);
 }
 
@@ -78,6 +81,8 @@ Args parse(int argc, char** argv) {
         else if (s == "--eta") a.opt.thresholdFactor = std::stod(next());
         else if (s == "--shift") a.opt.shift = std::stod(next());
         else if (s == "--fixed-keep") a.opt.fixedKeep = std::stoll(next());
+        else if (s == "--fuser") a.fuserHz = std::stod(next());
+        else if (s == "--mass-scale") a.massScale = std::stod(next());
         else if (s == "--leaf-size") a.opt.leafSize = std::stoll(next());
         else if (s == "--threads") a.opt.numThreads = std::stoi(next());
         else if (s == "--no-recover") a.opt.recoverVectors = false;
@@ -94,7 +99,7 @@ Args parse(int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const Args a = parse(argc, argv);
+    Args a = parse(argc, argv);
 
     amls::PencilPair pencil;
     amls::DefaultTraits::Vector lambdaRef;  // 闭式谱（若可用）
@@ -122,6 +127,25 @@ int main(int argc, char** argv) {
             pencil.M.setIdentity();
             std::cerr << "[amls_solve] 注意: 未提供 M,使用单位阵\n";
         }
+    }
+
+    if (a.massScale <= 0.0)
+        usage();
+    if (a.massScale != 1.0) {
+        pencil.M *= a.massScale;
+        std::cout << "[amls_solve] 质量缩放: M <- " << a.massScale
+                  << " * M\n";
+    }
+    if (a.fuserHz > 0.0) {
+        constexpr double kTwoPi = 6.283185307179586476925286766559;
+        // f_user 是"关注频段"上限(其下模态 ≈ nev);分量模态截断取
+        // η·f_user(η = thresholdFactor,AMLS 惯例:整体低模态需要高于它的
+        // 分量模态张成,直接用 f_user 截断会欠采样 p < nev)。
+        a.opt.lambdaCut = a.opt.thresholdFactor * kTwoPi * kTwoPi *
+                          a.fuserHz * a.fuserHz;
+        std::cout << "[amls_solve] f_user = " << a.fuserHz << " Hz (η="
+                  << a.opt.thresholdFactor << ") -> lambda_cut = "
+                  << a.opt.lambdaCut << "（分量截断；输出全部降阶模态）\n";
     }
 
     amls::Pencil<amls::DefaultTraits> km{pencil.K, pencil.M};

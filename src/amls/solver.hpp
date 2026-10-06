@@ -20,6 +20,10 @@ struct AmlsOptions {
     int64_t leafSize          = 500;
     double  thresholdFactor   = 2.0;    // η（ThresholdTruncation）
     int64_t fixedKeep         = 0;      // >0 时单趟固定截断（否则两趟：估计 λ̂ 后阈值截断）
+    double  lambdaCut         = 0.0;    // >0: 绝对特征值截断（f_user 模式，
+                                        //      λ_cut = η·(2πf_user)²，η=thresholdFactor；
+                                        //      分量模态截到 η 倍，输出关注频段全部模态）
+                                        //      优先级高于 fixedKeep/两趟
     int64_t nev               = 100;
     int64_t denseProjectedMax = 5000;   // P12 切换点
     double  shift             = 0.0;    // K ← K + shift·M（半正定 K 的零谱保护）

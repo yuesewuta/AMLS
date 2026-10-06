@@ -37,17 +37,15 @@ public:
     /// 半开区间 (lo, hi] 内全部特征对（按值），升序；K/M 被覆盖。
     void solveLocalInterval(DenseMatrix& K, DenseMatrix& M, Scalar lo,
                             Scalar hi, Vector& w, DenseMatrix& V) const {
-        if (useSil_(K, M)) {
-            sil::solveInterval(K, M, lo, hi, w, V);
-            if (!w.size())
-                dense_.solveInterval(K, M, lo, hi, w, V);
-            return;
-        }
         dense_.solveInterval(K, M, lo, hi, w, V);
     }
 
     /// 索引区间 [il, iu]（1-based，含端点）特征对，升序；K/M 被覆盖。
     /// il>1 时 SIL 单移位无法定位，自动回退稠密。
+    /// 已知局限：SIL（单向量 Lanczos）对简并特征值只返回一份副本
+    /// （实测 bcsstk18 的 729 重 λ=1 簇被吞）——因此 solveLocalInterval
+    /// 恒走稠密 dsygvx（Sturm 计数二分，对多重性安全）；本函数仅用于
+    /// 趟 A 的 λ̂ 估计，阈值估计偏大属安全方向，故保留 SIL 加速。
     void solveLocalIndex(DenseMatrix& K, DenseMatrix& M, int64_t il,
                          int64_t iu, Vector& w, DenseMatrix& V) const {
         const int64_t n = K.rows();
