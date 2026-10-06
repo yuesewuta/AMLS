@@ -75,6 +75,9 @@ target_link_libraries(amls_solve PRIVATE amls_lib)
 add_executable(amls_verify src/apps/amls_verify.cpp)
 target_link_libraries(amls_verify PRIVATE amls_lib)
 
+add_executable(reference_tool src/apps/reference_tool.cpp)
+target_link_libraries(reference_tool PRIVATE amls_lib)
+
 # ---------------------------------------------------------------------------
 # 测试
 # ---------------------------------------------------------------------------

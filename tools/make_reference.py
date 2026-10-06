@@ -219,6 +219,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default="benchmark")
     ap.add_argument("--only", default=None, help="只处理指定矩阵")
+    ap.add_argument("--import-eigen", action="append", default=[],
+                    metavar="NAME=FILE",
+                    help="从 reference_tool 文本导入前 200 阶特征值;给定后"
+                         "只处理导入的矩阵,解耦特征值仍解析并回")
     args = ap.parse_args()
 
     root = Path(args.dir)
@@ -226,7 +230,11 @@ def main():
     for d in (bin_dir, ref_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    names = [args.only] if args.only else MATRICES
+    imports = {}
+    for kv in args.import_eigen:
+        key, val = kv.split("=", 1)
+        imports[key] = val
+    names = list(imports) if imports else ([args.only] if args.only else MATRICES)
     csv_path = root / "f_user.csv"
     header = ["matrix", "n", "nnz", "mass_scale_alpha",
               "lambda_200", "f200_Hz", "f_user_Hz"]
@@ -242,24 +250,35 @@ def main():
                             f"{r['lam200']:.6e}", f"{r['f200']:.6e}",
                             f"{r['f_user']:g}"])
 
+    # 增量合并:先把 reference/ 里已有 npz 的行恢复进 rows(--only 重跑
+    # 单个矩阵时不会把 CSV 覆盖成单行;重算同名矩阵时在计算分支里移除旧行)
+    for npz_path in sorted(ref_dir.glob(f"*_ref{NEV}.npz")):
+        with np.load(npz_path) as z:
+            rows.append(dict(name=npz_path.name[: -len(f"_ref{NEV}.npz")],
+                             n=int(z["n"]), nnz=int(z["nnz"]),
+                             alpha=float(z["alpha"]),
+                             lam200=float(z["lam"][-1]),
+                             f200=float(z["f"][-1]),
+                             f_user=float(z["f_user"])))
+    write_csv()
+
     for name in names:
         print(f"[{name}]", flush=True)
         npz_path = ref_dir / f"{name}_ref{NEV}.npz"
         if npz_path.exists():
             print("  已有参考解,跳过(删除该 npz 可强制重算)", flush=True)
-            with np.load(npz_path) as z:
-                rows.append(dict(name=name, n=int(z["n"]), nnz=int(z["nnz"]),
-                                 alpha=float(z["alpha"]),
-                                 lam200=float(z["lam"][-1]),
-                                 f200=float(z["f"][-1]),
-                                 f_user=float(z["f_user"])))
-            write_csv()
             continue
+        rows[:] = [r for r in rows if r["name"] != name]   # 重算:移除旧行
 
         mtx = find_mtx(mtx_dir, name)
         A = load_stiffness(mtx)
         n, nnz = A.shape[0], A.nnz
-        mu = solve_reference(A)
+        if name in imports:
+            _coup, isoVals = split_decoupled(A)
+            mu = np.sort(np.concatenate(
+                [np.loadtxt(imports[name]), isoVals]))[:NEV]
+        else:
+            mu = solve_reference(A)
         if mu.size < NEV:
             sys.exit(f"{name}: 合并解耦特征值后仍不足 {NEV} 阶")
         mu = mu[:NEV]   # 前 NEV 阶(解耦解析值已并入并升序)
