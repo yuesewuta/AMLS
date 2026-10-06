@@ -82,12 +82,21 @@ extern std::atomic_flag g_mtBudgetLock;    // MT 预算互斥（try_lock 非阻�
 struct ScopedBudget {
     bool active = false;
     int saved = 1;
+    /// 诊断计数（AMLS_DEBUG_ADAPT）：预算获取成功次数 / 饥饿但被互斥
+    /// 挡掉次数 / 饥饿判定通过次数。
+    static inline std::atomic<int64_t> nBudgetGranted{0};
+    static inline std::atomic<int64_t> nBudgetContended{0};
+    static inline std::atomic<int64_t> nHungry{0};
     explicit ScopedBudget(int k) {
         static const bool mtEnabled = std::getenv("AMLS_NO_MT") == nullptr;
         if (!mtEnabled || !tls_starved || k <= 1)
             return;
-        if (g_mtBudgetLock.test_and_set(std::memory_order_acquire))
+        nHungry.fetch_add(1, std::memory_order_relaxed);
+        if (g_mtBudgetLock.test_and_set(std::memory_order_acquire)) {
+            nBudgetContended.fetch_add(1, std::memory_order_relaxed);
             return;   // 已有别的任务持有 MT 预算，本次保持单线程
+        }
+        nBudgetGranted.fetch_add(1, std::memory_order_relaxed);
         saved = 1;
         omp_set_num_threads(k);
         active = true;

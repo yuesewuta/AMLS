@@ -8,6 +8,8 @@
 // 全图可静态预建（结构不依赖运行时），只入队叶子；内点由完成事件推进。
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <deque>
 #include <exception>
@@ -101,10 +103,13 @@ public:
             return;
         starveStreak_.store(0, std::memory_order_relaxed);
         int lv = loadLevel_.load(std::memory_order_relaxed);
-        while (lv < kMaxLoadLevel &&
-               !loadLevel_.compare_exchange_weak(
-                   lv, lv + 1, std::memory_order_acq_rel,
-                   std::memory_order_relaxed)) {
+        while (lv < kMaxLoadLevel) {
+            if (loadLevel_.compare_exchange_weak(
+                    lv, lv + 1, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                nEscalations_.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
         }
     }
     /// 当前任务内并行度（DAG worker 任务入口设置到 opsTlsThreads）。
@@ -120,6 +125,19 @@ public:
         {
             std::unique_lock<std::mutex> lk(qm_);
             qc_.wait(lk, [&] { return pending_ == 0; });
+        }
+        if (std::getenv("AMLS_DEBUG_ADAPT") != nullptr) {
+            std::fprintf(stderr,
+                         "[adapt] 升档次数=%lld 最终档位=%d "
+                         "MT预算: 饥饿通过=%lld 获取=%lld 互斥挡=%lld\n",
+                         static_cast<long long>(nEscalations_.load()),
+                         finalLoadLevel(),
+                         static_cast<long long>(
+                             blas::ScopedBudget::nHungry.load()),
+                         static_cast<long long>(
+                             blas::ScopedBudget::nBudgetGranted.load()),
+                         static_cast<long long>(
+                             blas::ScopedBudget::nBudgetContended.load()));
         }
         if (firstEx_)
             std::rethrow_exception(firstEx_);
@@ -195,6 +213,13 @@ private:
     std::vector<std::thread> workers_;
     std::atomic<int> starveStreak_{0};   // 连续饥饿节点计数
     std::atomic<int> loadLevel_{0};      // 并行度档位（只升不降，0..3）
+public:
+    /// 诊断（AMLS_DEBUG_ADAPT）：升档触发次数与最终档位。
+    std::atomic<int64_t> nEscalations_{0};
+    int finalLoadLevel() const {
+        return loadLevel_.load(std::memory_order_relaxed);
+    }
+private:
 };
 
 } // namespace amls
