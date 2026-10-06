@@ -1,27 +1,28 @@
 #pragma once
-// step 2a：高斯消去模块（Hyun 2020 式 5–8 的消去半边；Gao TOMS'08 Fig.2 块消元）。
+// step 2a：高斯消去模块（约束模态 Ψ 存储形式；任务 = 依赖关系拆解表 N1–N5）。
 //
-// 对重排后的 (K, M) 按分割节点树单趟后序遍历：
-//   对每个节点 i：
-//     1. 块分解 K̂_ii = Lᵢ Dᵢ Lᵢᵀ（叶：稀疏 LDL；分割节点：稠密 LDL）
-//     2. W = K̂_ii⁻¹ M̂_ii（式 2 同余中间量；算子形式，无显式求逆——P5/P11）
-//     3. 每个祖先 a：X_a = K̂_ii⁻¹ K_{i,a}，Y_a = K̂_ii⁻¹ M_{i,a}
-//        （K_{i,a} = K_{a,i}ᵀ；式 5 约束模态 Ψ_{i,a} = −X_a 的实现载体）
-//     4. K 单边 Schur 更新：K̄_{a,a} −= K_{a,i}·X_a；K̄_{a,a'} −= K_{a,i}·X_{a'}
-//     5. M 双边同余更新（式 2 的 M⁽ⁱ⁾ 递归）：
-//          M̄_{a,a}  −= K_{a,i}Y_a + (K_{a,i}Y_a)ᵀ − K_{a,i}·W·X_a
-//          M̄_{a,a'} −= K_{a,i}Y_{a'} + (K_{a',i}Y_a)ᵀ − K_{a,i}·W·X_{a'}
+// 对重排后的 (K, M) 按分割节点树后序消去。每个节点 i（祖先 a，祖先对 hi>lo）：
+//   N1  u(i,a) = Ψ(i,a) = −K̂_ii⁻¹·K_{i,a}
+//       一次 LDL 分解 K̂_ii、逐祖先窄右端回代（右端零列经可逆回代保持零，
+//       解全程列压缩存储）；分解与回代完成后立即释放因子——后续所有阶段
+//       （N3–N5、缩聚、回代恢复）都不再需要 K̂⁻¹ 算子。
+//   N3  Mtemp(i,a) = M_{i,a} + M_ii·u(i,a)   （列 = u 列 ∪ M 耦合行模式）
+//   N4  K̄(a,lo) += K_{a,i}·u(i,lo)            （K 单边 Schur 更新）
+//   N5  M̄(a,lo) += M_{a,i}·u(i,lo) + u(i,a)ᵀ·Mtemp(i,lo)
+//       （Mtemp 形式：M_ijᵀΨ + ΨᵀM_iiΨ 两项合并，三重积消失——推导见
+//       papers/summary/公式.md；不再有 W/X/Y 中间量与按需回代）
+//   N2  释放 (a,i) 耦合列块（N1/N3/N4/N5 完成后 = CSV 的 Free-SubBlock）
 //
-// 不做截断 / 投影——那是子空间缩聚模块（式 16/17）的职责；
-// 消去与截断无关，因此两趟阈值估计只需重跑缩聚，消去只做一次。
-// 消去完成后全部因子与变换块保留，get 值接口供缩聚与恢复使用。
-// 所有矩阵乘走 OpenBLAS gemm，转置用 CblasTrans 标志不显式转置。
+// 叶子与分割节点公式同构：叶耦合块为原始稀疏、分割节点耦合块为列压缩
+// 稠密，经 blockops::accumulateProduct 的两个重载统一（点 3）。
+// 全部块更新化简为 A += B·C 与 A += Bᵀ·C 两种规范形态（linalg/colcomp.hpp）。
+//
+// 消去与截断无关，两趟阈值估计只跑一次消去数学（趟间 resetBlocks 重放）。
 #include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -42,11 +43,9 @@ struct GeBlockStat {
     int64_t rows;        // 块行数 n_a
     int64_t cols;        // 块列数 n_i
     int64_t nonzeroCols; // 耦合块 (a,i) 的非零列数 |B_i(a)|
-    int64_t xNZRows;     // X_a = K̂⁻¹K_{i,a} 的显著非零行数（1e-10 阈值）
-    int64_t yNZRows;     // Y_a = K̂⁻¹M_{i,a} 的显著非零行数
+    int64_t uNZRows;     // u(i,a) = Ψ 的显著非零行数（1e-10 阈值）
     double  kFrac;       // 耦合块显著非零元占比
-    double  xFrac;       // X_a = K̂⁻¹K_{i,a} 显著非零元占比
-    double  yFrac;       // Y_a = K̂⁻¹M_{i,a} 显著非零元占比
+    double  uFrac;       // u(i,a) 显著非零元占比
     bool    leaf;        // i 是否叶节点
 };
 struct GeNodeStat {
@@ -74,68 +73,69 @@ public:
     GaussianElimination(const Pencil<DefaultTraits>& reordered,
                         const SeparatorTree& tree);
 
-    /// 后序消去。numThreads>1 时按树层级并行（同层节点读写集合不相交，
-    /// 见 cpp 头注；祖先块的写冲突用条带锁）。完成后可通过 get 值接口
-    /// 访问全部结果。
+    /// 后序消去。numThreads>1 时按树层级并行（同层节点读写集合不相交；
+    /// 祖先块的写冲突用条带锁）。完成后可通过 get 值接口访问全部结果。
     void run(int numThreads = 1);
 
     /// DAG 并行：与 run() 同一消去数学，调度换成节点内子任务依赖图
-    /// （core/dag.hpp）。节点就绪 = 直接孩子 DONE（DONE(i)→F(parent)
-    /// 边显式化），不再有层 barrier——不同子树的节点可跨层并行；
-    /// 节点内：F(分解) → B(X/Y 回代, per 祖先) → C(WX, per 祖先) /
-    /// D(K Schur 更新) / E(M 同余更新) → DONE。写-写冲突仍由条带锁处理。
+    /// （core/dag.hpp）。节点就绪 = 直接孩子的 N4/N5 完成（无层 barrier）。
     void runDag(int numThreads);
 
     // ---- 统一 DAG（GE + 缩聚同一 runner；供融合流水线调用）----
-    struct GeDagTasks {
-        std::vector<DagTask*> f;     // per 节点 F（图根）
-        std::vector<DagTask*> done;  // per 节点 DONE（缩聚挂边的锚点）
+    struct EliminationDagTasks {
+        std::vector<DagTask*> n1;           // per 节点 N1（图根）
+        std::vector<DagTask*> n3;           // per 节点 N3
+        std::vector<DagTask*> updatesDone;  // per 节点 N4/N5 汇合哨兵
     };
     /// 只建图不运行：任务与依赖边全部 emplace 进外部 runner（不 ready）。
-    /// 缩聚任务建进同一 runner 后，由调用方 ready 全部叶子 F 并 waitIdle。
-    void buildDag(DagRunner& dag, GeDagTasks& out);
+    /// 缩聚任务建进同一 runner 后，由调用方 ready 全部叶子 N1 并 waitIdle。
+    void buildDag(DagRunner& dag, EliminationDagTasks& out);
 
-    /// 只缩内存不删表项：节点 i 的 (a,i) 耦合块与 diag 块的稠密数据清零、
-    /// 可选释放因子。结构（桶链）不动——可与无锁 find 并发（不动桶链，
-    /// 只写已存在表项的值）；这是统一 DAG 内"边算边放"的正式释放路径，
-    /// 与 releaseNode（趟间全删、串行安全）互补。const：内部缓存语义，
-    /// 调用方以 DAG 依赖序保证此刻无人再读节点 i 的块。
-    void shrinkNodeData(int64_t i, bool releaseFactor) const;
-
-    // ---- Mtemp（W = K̂⁻¹M̂）复用接口（供子空间缩聚）----
-    /// 缩聚右投影（式 16/17a）对 Mtemp 的复用：K̂⁻¹(M̂·Z) = (K̂⁻¹M̂)·Z
-    /// = W·Z（结合律，同 makeWX 的 T3）。返回节点 i 缓存的 W；未物化/
-    /// 已释放返回 nullptr，调用方回退 solveFactor 回代。仅统一 DAG 路径
-    /// 可用（ElimData 存活且 W 未释放）；旧路径恒为 nullptr。
-    const DenseMatrix* nodeW(int64_t i) const;
-    /// 统一 DAG 路径下 W 的释放移交给缩聚（f 用完才放）：置位后 GE 的
-    /// DONE/relW 不再释放 d.W，由 cond.rel(i) 调 releaseNodeW。
-    void deferWRelease() const { wReleaseDeferred_ = true; }
-    /// cond.rel(i) 调用：缩聚已用完节点 i 的 W（rel 排在 f(i) 之后）。
-    void releaseNodeW(int64_t i) const;
-
-    // ---- 融合流水线（GE + 谱 + 投影逐层交织，releaseNode 及时释放）----
+    // ---- 逐层路径（GE + 谱 + 投影逐层交织，releaseNodeData 及时释放）----
     int64_t maxLevel() const { return maxLevel_; }
     const std::vector<int64_t>& levelNodes(int64_t l) const {
         return byLevel_[static_cast<size_t>(l)];
     }
     /// 消去第 l 层（可重入：只依赖 orig* 稀疏原块，重跑结果逐位一致）。
     void runLevel(int64_t l, int numThreads);
-    /// 释放节点 i 的消去产物（kDiag/mDiag/(a,i) 耦合块；保留因子与
-    /// orig* 稀疏原块）。释放后 kCoupling/mCoupling/kDiag/mDiag 接口
-    /// 对该节点不可用；backtransform 需要这些块，恢复向量时不得释放。
-    void releaseNode(int64_t i);
+    /// 释放节点 i 的消去产物（diag 块、(a,i) 耦合列、Mtemp 列；
+    /// keepConstraintModes=false 时连同 u 列一起释放——回代恢复需要 u，
+    /// 恢复向量时调用方传 true）。逐层路径趟内调用（串行区，可 erase）。
+    void releaseNodeData(int64_t i, bool keepConstraintModes);
 
-    /// 清空全部动态块表（四张 ColComp 表），供"同一 GE 对象重跑一遍完整
-    /// 消去"前调用。典型场景：twoPass 趟 B 重跑且趟 A 因 keepFactors
-    /// 未释放——残留旧块会让重跑变成在旧值上累加（K̂ 失去正定性）。
+    /// 清空全部动态数据（四张块表 + u/Mtemp 的值），供"同一 GE 对象重跑
+    /// 一遍完整消去"前调用。典型场景：twoPass 趟 B 重跑且趟 A 因
+    /// recoverVectors 未释放——残留旧块会让重跑变成在旧值上累加。
     /// 因子与符号表不受影响（重跑时重算/复用）。
     void resetBlocks();
 
+    // ---- 任务函数（N1–N5 + 释放；逐层路径与 DAG 路径共用同一实现）----
+    /// N1：约束模态 u(i,a) = −K̂_ii⁻¹·K_{i,a}（一次分解、逐祖先窄回代；
+    /// 完成后释放因子）。依赖：全部后代的 N4/N5 完成（diag/耦合列定稿）。
+    void computeConstraintModes(int64_t i);
+    /// N3：Mtemp(i,a) = M_{i,a} + M_ii·u(i,a)。依赖：N1(i)。
+    void buildTemporaryMass(int64_t i);
+    /// N4 对角：K̄(a,a) += K_{a,i}·u(i,a)。
+    void stiffnessDiagUpdate(int64_t i, int64_t a);
+    /// N4 耦合：K̄(hi,lo) += K_{hi,i}·u(i,lo)。
+    void stiffnessCoupUpdate(int64_t i, int64_t hi, int64_t lo);
+    /// N5 对角：M̄(a,a) += M_{a,i}·u(i,a) + u(i,a)ᵀ·Mtemp(i,a)。
+    void massDiagUpdate(int64_t i, int64_t a);
+    /// N5 耦合：M̄(hi,lo) += M_{hi,i}·u(i,lo) + u(i,hi)ᵀ·Mtemp(i,lo)。
+    void massCoupUpdate(int64_t i, int64_t hi, int64_t lo);
+    /// N2：释放 (a,i) 耦合列块（值缩容；依赖：N1/N3/N4/N5(i) 全部完成）。
+    void releaseCouplingColumn(int64_t i) const;
+    /// 释放 diag 块（值缩容；依赖：N1(i) 与局部谱 N7(i) 完成）。
+    void releaseDiagonalBlocks(int64_t i) const;
+    /// 释放 Mtemp 列（值缩容；依赖：N5(i) 与 N8(i) 完成）。
+    void releaseTemporaryMass(int64_t i) const;
+    /// 释放 u 列（值缩容；依赖：N9/N10 折叠传播 fold(i) 完成；
+    /// recoverVectors 时不调用——回代恢复需要 u）。
+    void releaseConstraintModes(int64_t i) const;
+
     /// 调试：四个稠密块表的当前总字节数（诊断峰值内存构成）。
     double denseBytes() const;
-    /// 调试：稠密块零列统计（列稀疏性数据支撑）。返回全零块数/总块数，
-    /// 经引用带出 零列总数/总列数（含 kDiag/mDiag）。
+    /// 调试：稠密块零列统计（列稀疏性数据支撑）。
     void zeroColStats(int64_t& zeroCols, int64_t& totalCols,
                       int64_t& zeroBlocks, int64_t& totalBlocks) const;
 
@@ -148,59 +148,57 @@ public:
     const SeparatorTree& tree() const { return tree_; }
     const std::vector<int64_t>& postOrder() const { return order_; }
 
-    /// 算子插件（默认 OpenBLAS 后端；注入其他实现可替换 gemm/gemv 内核）。
-    const ColCompOps& ops() const { return *ops_; }
-    void setOps(const ColCompOps& o) { ops_ = &o; }
-
     /// 节点 i 的变换后对角块（分割节点稠密消去累计值；ident 恒等表，
     /// .data 即全列稠密矩阵）。叶节点请用 origKDiag/origMDiag（稀疏）。
     const ColComp& kDiag(int64_t i) const { return kDiag_.at(i); }
     const ColComp& mDiag(int64_t i) const { return mDiag_.at(i); }
     bool hasDiag(int64_t i) const { return kDiag_.count(i) != 0; }
 
-    /// (a, lo)：行祖先 a × 列后代 lo 的消去后耦合块（= 该对在其共同
-    /// 后代全部消去完成时刻的状态，这正是缩聚右投影所需的快照）。
-    /// 列压缩：.cols 为升序存储列（ident 时为空表 = 全列）。
-    const ColComp& kCoupling(int64_t a, int64_t lo) const {
-        return kCoup_(a, lo);
+    /// 约束模态 u(i,a) = Ψ(i,a)（列压缩；cols = a 空间非零列）。
+    /// N1(i) 后可用，fold(i)（或回代恢复）后释放。
+    const ColComp& constraintModes(int64_t i, int64_t a) const {
+        return constraintModes_.at(modeKey_(i, a));
     }
-    const ColComp& mCoupling(int64_t a, int64_t lo) const {
-        return mCoup_(a, lo);
-    }
-    bool hasCoupling(int64_t a, int64_t lo) const {
-        return kCoupD_.count(key_(a, lo)) != 0;
+    /// Mtemp(i,a) = M_{i,a} + M_ii·u(i,a)（列压缩，行 = i 空间全）。
+    /// N3(i) 后可用，N8(i) 后释放。
+    const ColComp& temporaryMass(int64_t i, int64_t a) const {
+        return temporaryMass_.at(modeKey_(i, a));
     }
 
-    /// 原始（重排后）稀疏子块——叶节点对角块与全部原始耦合块。
+    /// 原始（重排后）稀疏对角块（叶节点局部谱输入）。
     const SparseMatrix& origKDiag(int64_t i) const {
         return origKDiag_.at(i);
     }
     const SparseMatrix& origMDiag(int64_t i) const {
         return origMDiag_.at(i);
     }
-    const SparseMatrix& origKCoupling(int64_t a, int64_t lo) const;
-    const SparseMatrix& origMCoupling(int64_t a, int64_t lo) const;
 
-    /// 块算子（式 5 Ψ 的实现）：X = K̂_ii⁻¹ B。B/X 稠密，列数任意。
-    void solveFactor(int64_t i, const DenseMatrix& B, DenseMatrix& X) const;
+    /// 符号填充 pass 终态行模式（供 MassCouplingStore 预算 μ̃ 列模式）：
+    /// (a,i) 块消去完成时刻的非零行 = u(i,a) / M 耦合 (i,a) 的列模式。
+    const ColMask& symbolicRowK(int64_t a, int64_t i) const {
+        return rowKFinal_.at(key_(a, i));
+    }
+    const ColMask& symbolicRowM(int64_t a, int64_t i) const {
+        return rowMFinal_.at(key_(a, i));
+    }
 
     /// 测量模式：非空时消去过程记录块结构统计（不影响数值）。
     GeStats* stats = nullptr;
 
-    /// 消去内部阶段计时（秒）：factor / solve（W、X、Y 回代）/ schurK /
-    /// congrM（M 同余更新），各分 .leaf / .sep 两路聚合。
+    /// 消去内部阶段计时（秒）：factor / solve（N1 回代）/ mtemp（N3）/
+    /// schurK（N4）/ congrM（N5），各分 .leaf / .sep 两路聚合。
     const std::map<std::string, double>& lastTiming() const { return timing_; }
 
-    /// 细粒度性能探针（原子累加，秒；诊断列压缩各算子开销构成）。
+    /// 细粒度性能探针（原子累加，秒；诊断各算子开销构成）。
     struct GePhaseProf {
         std::atomic<double> schurKdiag{0}, schurKcoup{0};
-        std::atomic<double> congDiagT{0}, congDiagWX{0}, congDiagT2{0};
-        std::atomic<double> congCoup{0};
-        std::atomic<double> solveExpandT{0}, solveRhs{0};
+        std::atomic<double> massDiagTerm1{0}, massDiagTerm2{0};
+        std::atomic<double> massCoupTerm1{0}, massCoupTerm2{0};
+        std::atomic<double> mtempBuild{0}, solveRhs{0};
     };
     static GePhaseProf& phaseProf() {
-        static GePhaseProf p;
-        return p;
+        static GePhaseProf prof;
+        return prof;
     }
     /// C++17 无 atomic<double>::fetch_add，用 CAS 循环（relaxed）。
     static void profAdd(std::atomic<double>& v, double d) {
@@ -210,10 +208,11 @@ public:
             ;
     }
     static void phaseProfReset() {
-        GePhaseProf& p = phaseProf();
+        GePhaseProf& prof = phaseProf();
         for (std::atomic<double>* v :
-             {&p.schurKdiag, &p.schurKcoup, &p.congDiagT, &p.congDiagWX,
-              &p.congDiagT2, &p.congCoup, &p.solveExpandT, &p.solveRhs})
+             {&prof.schurKdiag, &prof.schurKcoup, &prof.massDiagTerm1,
+              &prof.massDiagTerm2, &prof.massCoupTerm1, &prof.massCoupTerm2,
+              &prof.mtempBuild, &prof.solveRhs})
             v->store(0.0);
     }
 
@@ -231,28 +230,33 @@ private:
     std::unordered_map<int64_t, SparseMatrix> origKCoup_, origMCoup_;
 
     // 消去过程动态块（列压缩；diag 为 ident 全表退化情形）
-    // kDiag_/mDiag_ 也 mutable：统一 DAG 的 shrinkNodeData 在 const ge_
-    // 上按依赖序缩容（只动值不动结构）。
+    // 四表均 mutable：统一 DAG 的按依赖序值缩容在 const 路径上亦可表述
+    // （只动值不动结构）。
     mutable std::unordered_map<int64_t, ColComp> kDiag_;    // 分割节点 K̂_ii
     mutable std::unordered_map<int64_t, ColComp> kCoupD_;  // (anc, lo) K 耦合
     mutable std::unordered_map<int64_t, ColComp> mDiag_;    // 分割节点 M̂_ii
     mutable std::unordered_map<int64_t, ColComp> mCoupD_;  // (anc, lo) M 耦合
-    // 符号填充 pass 产物：各耦合块的终态列模式（= 出生表；诞生后即擦除
-    // 以省内存）。消去 i 时 colK(hi,lo) |= rowK(lo,i)（K 更新列来自
-    // X=K̂⁻¹K_{i,lo} 的非零列 = K_{lo,i} 的非零行；M 更新同理由 M 行驱动）。
+    // 约束模态 u(i,a) = Ψ 与 Mtemp(i,a)：键 = modeKey_(i,a)，precompute_
+    // 预建全部键（运行期只写值，无结构变更）。
+    mutable std::unordered_map<int64_t, ColComp> constraintModes_;
+    mutable std::unordered_map<int64_t, ColComp> temporaryMass_;
+    // 符号填充 pass 产物：各耦合块的终态列模式（= 出生表）与终态行模式
+    //（行模式供 MassCouplingStore 预算 μ̃ 列模式）。消去 i 时
+    // colK(hi,lo) |= rowK(lo,i)（N4 积列 = u(i,lo) 列 = K_{lo,i} 非零行）；
+    // colM(hi,lo) |= rowK(lo,i) ∪ rowM(lo,i)（N5 两项）。
     std::unordered_map<int64_t, ColMask> kColFinal_, mColFinal_;
-    const ColCompOps* ops_ = &defaultColCompOps();
+    std::unordered_map<int64_t, ColMask> rowKFinal_, rowMFinal_;
     // 符号 pass 漏列计数（诞生注入时原块列不在表中；预期恒 0）
     std::atomic<int64_t> nMiss_{0};
 
-    // 因子（恢复与缩聚右投影的块算子载体）。mutable：shrinkNodeData 的
-    // 按依赖序释放（const 语义，同块表）。
-    mutable std::vector<std::unique_ptr<EigenSimplicialLDLTSolver<DefaultTraits>>>
+    // 因子（N1 内部载体：分解 → 逐祖先回代 → 立即释放；之后无消费者）。
+    std::vector<std::unique_ptr<EigenSimplicialLDLTSolver<DefaultTraits>>>
         sparseFactors_;
-    mutable std::vector<std::unique_ptr<DenseLDLTSolver<DefaultTraits>>>
+    std::vector<std::unique_ptr<DenseLDLTSolver<DefaultTraits>>>
         denseFactors_;
 
     int64_t key_(int64_t hi, int64_t lo) const { return hi * N_ + lo; }
+    int64_t modeKey_(int64_t i, int64_t a) const { return i * N_ + a; }
 
     std::map<std::string, double> timing_;
 
@@ -261,68 +265,12 @@ private:
     std::vector<int64_t> level_;          // 节点 → 层级
     int64_t maxLevel_ = 0;
 
-    // ---- 层并行（numThreads>1）----
-    /// 节点消去的数据段：因子分解 + W/X/Y 回代（无共享写，可并行）。
-    struct ElimData {
-        std::vector<int64_t> anc;
-        DenseMatrix W;
-        // 约束量 Ψ = K̂_ii⁻¹·K_{i,a} / K̂_ii⁻¹·M_{i,a}：右端零列经可逆
-        // 回代保持零 ⇒ 全程列压缩存储（cols = a 空间非零列，data 窄存
-        // n_i×c_a）；下游 Schur/同余算子按交集列跳过零列（dgemm n 维
-        // 缩小）。缺省 = 空表（全零解）。ident 恒 false。
-        std::unordered_map<int64_t, ColComp> X, Y;
-        // (K̂⁻¹M̂)·X_a 的窄存缓存（C 任务产物；DAG 路径下 E 任务直接取，
-        // 不做 makeWX 的重复计算）。键 = 祖先 a。DAG 路径下多任务并发
-        // 读写——建图阶段预填全部键（nullopt），任务阶段不触发结构变更。
-        std::unordered_map<int64_t, std::optional<ColComp>> WX;
-        // Mtemp = W̃ = K̂⁻¹M̂（n_i×n_i）：节点级惰性物化（makeWX 首次
-        // 需要时一次宽回代），之后 WX_a = W̃·X_a（gemm，免逐次回代），
-        // 缩聚 f 的 WMz = W̃·Z_i（式 16/17a）复用同一份。per 祖先 C 任务
-        // 无相互依赖可并发首次进入——物化经 wMut 互斥、happens-before
-        // 后锁外读。wTransformed 一旦为真 d.W 不再被写。
-        bool wTransformed = false;
-        std::mutex wMut;
-        // 释放互斥：unordered_map 的 erase 会改写桶链，同桶并发 erase
-        // （relX(u)/relX(u') 同 prio 同就绪、clear+erase 交叉）会竞争前驱
-        // 指针 → 堆破坏（46k/12 线程随机 AV 的根因）。erase/clear 统一走锁；
-        // 值的读写（B 写 X[a]、D/E 读）不触结构，无需锁。
-        std::mutex relMut;
-    };
-
-    // DAG 运行期数据段（buildDag 预建，跨 GE/缩聚两阶段存活：
-    // 缩聚 f 经 nodeW 复用 W 需要 ElimData 在 DAG 跑完后仍可达）。
-    std::vector<std::shared_ptr<ElimData>> dagData_;
-    mutable bool wReleaseDeferred_ = false;   // 统一 DAG：W 释放移交 cond.rel(i)
-    /// F 任务：K̂_ii 因式分解 + M̂_ii 缓存（d.W）。根节点此后无事。
-    void factorNode_(int64_t i, ElimData& d);
-    /// B 任务（per 祖先 a）：X_a / Y_a 回代（式 7a/8a 约束量）。
-    void solveXYAnc_(int64_t i, ElimData& d, int64_t a, bool leaf);
-    /// 旧路径整段：全部祖先的 X/Y + 块/节点统计 + solve 计时。
-    void solveXY_(int64_t i, ElimData& d);
-    /// C 任务：WX_a = K̂_ii⁻¹(M̂_ii·X_a)（式 8c/7c，T3 结合律；
-    /// 已算过则直接取缓存）。需 X_a 与其非零列表（B 之后）。
-    const ColComp& makeWX_(int64_t i, ElimData& d, int64_t a) const;
-    /// D/E 任务体（旧路径 applyNodeB_ 的循环体原样抽出，
-    /// 含条带锁与 phaseProf 计时；不含 timing_ 段计时）。
-    void schurKDiagTask_(int64_t i, ElimData& d, int64_t a, bool leaf);
-    void schurKCoupTask_(int64_t i, ElimData& d, int64_t hi, int64_t lo,
-                         bool leaf);
-    void congDiagTask_(int64_t i, ElimData& d, int64_t a, bool leaf);
-    void congCoupTask_(int64_t i, ElimData& d, int64_t hi, int64_t lo,
-                       bool leaf);
-    void computeNodeA_(int64_t i, ElimData& d);
-    /// 更新段：Schur / 同余写入祖先块（条带锁保护写-写冲突）。
-    void applyNodeB_(int64_t i, ElimData& d);
-    /// DAG 统计辅助：节点级 GeNodeStat（F 任务尾部调用）。
+    /// 节点级统计（F 任务尾部调用）。
     void recordNodeStat_(int64_t i);
     /// 目标块写锁（per-key 细粒度）：同一目标块的累加串行化，不同 key
-    /// 永不互斥——256 条带哈希碰撞 + 大 dgemm 持锁曾把 12 线程扩展比
-    /// 压到 1.05x（护航）。锁对象惰性建（create=结构变更，走 structMutex_），
-    /// 查锁表为读多写少，用 shared_mutex。
+    /// 永不互斥。锁对象惰性建（create=结构变更，走 keyLocksMutex_）。
     std::shared_mutex keyLocksMutex_;
     std::unordered_map<int64_t, std::unique_ptr<std::mutex>> keyLocks_;
-    /// 取 key 的写锁（不存在则建）。返回引用——表仅在 structMutex_ 下
-    /// 插入，unique_ptr 所指 mutex 生命周期随 GE 对象，引用稳定。
     std::mutex& keyLock_(int64_t key);
     mutable std::mutex structMutex_;
     std::mutex statsMutex_;
@@ -331,26 +279,24 @@ private:
                               int64_t c0, int64_t c1) const;
     void precompute_();
     void eliminateNode_(int64_t i);
+    void solveWithFactor_(int64_t i, const DenseMatrix& rhs,
+                          DenseMatrix& solution) const;
 
     // 取/建块（消去过程）
     const SparseMatrix& origK_(int64_t a, int64_t lo) const;
     const SparseMatrix& origM_(int64_t a, int64_t lo) const;
 
-    /// 读访问：返回 (a,lo) 耦合块；不存在则诞生空表块（只读场景——
-    /// 该块未收过任何更新，等价于旧实现的 Zero(n_a×n_lo) 块）。
-    /// 调用方须遵守层 barrier 纪律（见 cpp 头注），表在此期间静态。
+    /// 读访问：返回 (a,lo) 耦合块；不存在则诞生空表块（只读场景）。
     const ColComp& kCoup_(int64_t a, int64_t lo) const;
     const ColComp& mCoup_(int64_t a, int64_t lo) const;
 
-    /// 写访问：返回可累加的 (a,lo) 目标块。表在诞生时取自符号填充
-    /// pass 的终态列模式（出生即终态，不存在运行时列插入；层 barrier
-    /// 纪律保证同层无读-写并发，条带锁保证写-写串行）。
+    /// 写访问：返回可累加的 (a,lo) 目标块（出生表 = 符号 pass 终态列模式）。
     ColComp& kCoupTarget_(int64_t hi, int64_t lo);
     ColComp& mCoupTarget_(int64_t hi, int64_t lo);
     ColComp& kDiagTarget_(int64_t a);   // ident 全表
     ColComp& mDiagTarget_(int64_t a);
 
-    /// 符号填充 pass：由 orig* 模式精确预算全部耦合块的终态列模式
+    /// 符号填充 pass：由 orig* 模式精确预算全部耦合块的终态列/行模式
     ///（标准"无精确抵消"假定；fill 语义与数值 GE 一致）。
     void symbolicFill_();
 };

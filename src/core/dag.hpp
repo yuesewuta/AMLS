@@ -1,9 +1,10 @@
 #pragma once
 // DAG 调度器：N 个常驻 worker + 共享就绪队列（mutex/CV）。
 // 任务 = fn + 前驱计数 + 后继表；前驱完成时递减后继计数，归零即入队。
-// 用于 GE 节点内 a–h 子任务 DAG（Hyun 2020 式 7/8/16/17 的任务拆分）：
-//   节点就绪 = 直接孩子全部完成（DONE(i) → F(parent) 边显式化），
-//   节点内 B(X/Y) → C(WX) / D(K 更新) / E(M 更新) → DONE。
+// 用于 GE/缩聚统一子任务 DAG（依赖关系拆解表 N1–N10 的任务拆分）：
+//   节点就绪 = 直接孩子 N4/N5 完成（updatesDone 哨兵 → N1(parent) 边显式化），
+//   节点内 N1(u 回代) → N3(Mtemp) → N4(K 更新) / N5(M 更新) → 哨兵 →
+//   N7(局部谱) → N8(μ̃ 种子) → fold(N9 折叠 / N10 传播)。
 // 全图可静态预建（结构不依赖运行时），只入队叶子；内点由完成事件推进。
 #include <atomic>
 #include <condition_variable>
@@ -81,7 +82,7 @@ public:
     // 判定（在节点 DONE 任务里调用）：就绪队列空 且 活跃 worker ≤2
     // （多数线程无事可做 = 负载不均衡）。连续 3 个节点判定成立 → 升一档。
     // 档位映射任务内并行线程数 {1,2,4,8}。近根段就绪队列常年枯竭 +
-    // 右耦合大任务串行，正是该机制的触发区；一旦升档，后续 D/E 任务的
+    // 右耦合大任务串行，正是该机制的触发区；一旦升档，后续 N4/N5 任务的
     // 主 dgemm 按目标列分组并行（见 colcomp.hpp dgemmCols）。
     static constexpr int kMaxLoadLevel = 3;
     void noteNodeDone() {

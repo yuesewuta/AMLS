@@ -1,36 +1,36 @@
 #pragma once
-// step 2b：子空间缩聚模块（Hyun 2020 式 16–17；Gao Fig.2 的谱截断 + 投影半边）。
+// step 2b：子空间缩聚模块（约束模态 Ψ/Mtemp 形式；任务 = 依赖关系拆解表
+// N7–N10）。
 //
 // 向高斯消去模块（GaussianElimination）与特征对求解模块（EigenpairSolver）
-// get 值，三个阶段：
+// get 值，四个任务：
 //
-//   I.  局部谱（式 4）：K̂_ii Φ_i = M̂_ii Φ_i Λ_i，按截断保留 k_i 阶。
-//       所有节点的 (K̂_ii, M̂_ii) 在消去完成后即固定、相互独立——
-//       线程池并行（叶间 / 兄弟节点间天然并行，OOC 论文 §Parallel Computing）。
+//   N7  局部谱：K̂_ii·eigenvectors_i = M̂_ii·eigenvectors_i·eigenvalues_i，
+//       按截断保留 keptModes_i 阶。全部节点输入在各自 N4/N5 汇合后固定、
+//       相互独立——线程池/DAG 并行。
+//   N8  种子：μ̃(c,a) = eigenvectors_cᵀ·Mtemp(c,a)（c 的全部祖先 a），
+//       写入 MassCouplingStore（右耦合结果的独立载体，本类不再持有）。
+//   N9  折叠：m(c,i) = μ̃(c,i)·eigenvectors_i，转置后产出降阶质量块
+//       ReducedMassBlock{rowNode=i, colNode=c, block=(k_i × k_c)}。
+//   N10 传播：μ̃(c,a) += μ̃(c,i)·u(i,a)（i 在 c→a 路径上），沿树向上。
 //
-//   II. 投影装配（式 7/8 的 T = ΨΦ 结构；式 16/17 的
-//       T̃ = [T_d·T_s^d, T_d·T_s^r, T_r] 主-残余组合在树递归中的实现）：
-//       后序遍历，对每个节点 i
-//         · 右投影（式 5+8 的 Ψ 作用，经 GE 块算子）：
-//           M̄_{a,i} = (M̄_{a,i} − K̄_{a,i}·K̂_ii⁻¹·M̂_ii)·Z_i，a 为祖先
-//         · 中间节点列更新：对已通过的后代列 kk，
-//           M̄_{a,kk} −= K̄_{a,i}·K̂_ii⁻¹·M̄_{i,kk}
-//         · 左投影：M̃_{i,kk} = Z_iᵀ·M̄_{i,kk}（完成 M̃ 的第 i 行）
-//       全部乘积走 OpenBLAS gemm，转置用 CblasTrans 标志不显式转置。
+// 输出降阶 pencil：K̃ = diag(eigenvalues_i)（P3），M̃ 非对角树块表
+//（P4；对角块 = I，P8，局部特征向量 M-正交）。
 //
-//   III. 输出降阶 pencil：K̃ = diag(μ_i)（对角性质，P3），
-//        M̃ 非对角树块表（行节点为列节点祖先，P4；对角块 = I，P8）。
+// μ̃ 单写者链：种子(c) → 沿 c→a 路径的 fold 序列；树路径全序 + DAG 依赖
+//（fold(i) ← fold(孩子)、fold(i) ← N8(全部后代)）保证任意时刻单写者，
+// MassCouplingStore 内部无锁。
 //
-// Φ_i（保留的局部特征向量 Z_i）与约束模态载体（GE 保留的因子与耦合块）
-// 均不释放，供特征向量恢复（step 4）使用。
+// 特征向量恢复（step 4）只需 u 与 eigenvectors（纯 GEMM 回代，
+// z_i = eigenvectors_i·q_i + Σ_a u(i,a)·z_a）——不再需要 K̂⁻¹ 因子与耦合块。
 #include <cstdint>
 #include <map>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 
 #include "amls/eigenpair_solver.hpp"
 #include "amls/gaussian_elimination.hpp"
+#include "amls/mass_coupling_store.hpp"
 #include "amls/separator_tree.hpp"
 #include "amls/spectral_truncation.hpp"
 #include "core/types.hpp"
@@ -44,18 +44,18 @@ public:
     using Vector       = DefaultTraits::Vector;
 
     /// M̃ 的非对角树块（P4）：rowNode 为 colNode 的祖先。
-    struct ProjBlock {
+    struct ReducedMassBlock {
         int64_t rowNode, colNode;
-        DenseMatrix block;  // k_row × k_col
+        DenseMatrix block;  // keptModes_row × keptModes_col
     };
 
     struct Result {
-        int64_t p = 0;                        // 降阶问题规模
-        std::vector<int64_t> projOffset;      // 每节点在投影空间的偏移
-        std::vector<int64_t> k;               // 每节点保留谱分量数
-        std::vector<Vector> mu;               // 保留局部特征值（K̃ 的对角，P3）
-        std::vector<DenseMatrix> Z;           // 保留局部特征向量 Φ_i（n_i × k_i）
-        std::vector<ProjBlock> mprojBlocks;   // M̃ 非对角块（对角块 = I，P8）
+        int64_t reducedSize = 0;               // 降阶问题规模 p
+        std::vector<int64_t> reducedOffset;    // 每节点在投影空间的偏移
+        std::vector<int64_t> keptModes;        // 每节点保留谱分量数 k_i
+        std::vector<Vector> eigenvalues;       // 保留局部特征值（K̃ 对角，P3）
+        std::vector<DenseMatrix> eigenvectors; // 保留局部特征向量（n_i × k_i）
+        std::vector<ReducedMassBlock> reducedMassBlocks;  // M̃ 非对角块
     };
 
     SubspaceCondensation(const GaussianElimination& ge, EigenpairSolver& eig)
@@ -66,61 +66,64 @@ public:
     Result run(const ISpectralTruncation<DefaultTraits>& truncation,
                int numThreads);
 
-    /// 统一 DAG：SPEC/f/g/h/rel 任务与 GE 任务进同一 runner（依赖边挂到
-    /// geInfo.done）。deps（静态过近似，过同步成本≈0——GE 内部边已把
-    /// geDone(kk) 排在 geDone(i) 之前）：
-    ///   SPEC(i) ← geDone(i)
-    ///   f(i)（右投影，写 mbar(a,i)）← SPEC(i)
-    ///   g(i)（中间列更新，读行 i 块、写祖先行块）← geDone(i), g(j) ∀j∈后代(i)
-    ///   h(i)（左投影 M̃，读行 i 块）← SPEC(i), g(j) ∀j∈后代(i)
-    ///   rel(i)（mbar 行释放 + ge_.shrinkNodeData）← f(i), g(i), h(i)
-    /// g 与 h 只读同一批行块、互不依赖（可并行）；行块释放等二者都完成。
-    /// 调用方负责：beginPass() → buildDag → ready GE 叶子 → waitIdle →
-    /// finalize(res)。releaseData=false 时（恢复向量）不做任何释放。
+    /// 统一 DAG：N7–N10 与 GE 任务进同一 runner（依赖边挂到 geInfo）。
+    ///   N7(i) ← updatesDone(i)（叶经哨兵 ← N1）
+    ///   N8(i) ← N7(i), N3(i)
+    ///   fold(i) ← N1(i), N7(i), N8(i), fold(孩子), N8(全部后代)
+    ///   freeMtemp(i) ← updatesDone(i), N8(i)
+    ///   freeDiag(i) ← N1(i), N7(i)
+    ///   freeU(i) ← fold(i)（releaseData=false 即恢复向量时不建——回代需要 u）
+    /// 调用方负责：beginPass() → buildDag → ready GE 叶子 N1 → waitIdle →
+    /// finalize(res)。
     void buildDag(DagRunner& dag, Result& res,
                   const ISpectralTruncation<DefaultTraits>& truncation,
-                  const GaussianElimination::GeDagTasks& geInfo,
+                  const GaussianElimination::EliminationDagTasks& geInfo,
                   bool releaseData);
 
     // ---- 融合流水线 API（与 GE 逐层交织；solver 驱动）----
-    /// 每趟调用一次：清空投影工作表。
+    /// 每趟调用一次：重建 μ̃ 存储槽位（GE 符号 pass 行模式预算列模式）。
     void beginPass();
-    /// 第 l 层局部谱（式 4）+ 截断选择，填充 res.k/mu/Z。
+    /// 第 l 层局部谱（N7）+ 截断选择，填充 res.keptModes/eigenvalues/
+    /// eigenvectors。
     void spectralLevel(const ISpectralTruncation<DefaultTraits>& truncation,
                        int64_t l, int numThreads, Result& res);
-    /// 第 l 层投影装配（式 16/17 的树递归实现）。
+    /// 第 l 层投影：N8 种子 + N9/N10 折叠传播（节点间块读写不相交）。
     void projectLevel(int64_t l, int numThreads, Result& res);
-    /// 投影偏移与降阶规模（阶段 III）。
+    /// 投影偏移与降阶规模。
     void finalize(Result& res);
 
-    /// 阶段计时（秒）：spectral = 并行局部谱，projection = 后序投影装配。
+    // ---- 任务函数（N7–N10；逐层路径与 DAG 路径共用同一实现）----
+    /// N7：局部谱 + 截断选择（写 res.keptModes/eigenvalues/eigenvectors(i)）。
+    void solveLocalEigenproblem(
+        int64_t i, const ISpectralTruncation<DefaultTraits>& truncation,
+        Result& res);
+    /// N8：μ̃(i,a) = eigenvectors_iᵀ·Mtemp(i,a)（i 的全部祖先 a）。
+    void seedMassCoupling(int64_t i, const Result& res);
+    /// N9 + N10：折叠列 i 产出降阶质量块，随后沿路径传播并释放 μ̃ 列 i。
+    /// keptModes_i = 0 时折叠为空操作，传播照常（链不可断）。
+    void foldAndPropagate(int64_t i, Result& res);
+
+    /// 阶段计时（秒）：spectral = 并行局部谱，projection = 种子+折叠传播。
     const std::map<std::string, double>& lastStageTiming() const {
         return stageTiming_;
     }
 
-    /// step 4（可选）：回代 z = L⁻ᵀ S q。Q: p × m（投影坐标）→ n × m（重排坐标）。
+    /// step 4（可选）：纯 GEMM 回代 z_i = eigenvectors_i·q_i + Σ_a u(i,a)·z_a。
+    /// Q: p × m（投影坐标）→ n × m（重排坐标）。需要 u 与 eigenvectors
+    /// 存活（recoverVectors 时调用方不释放）。
     DenseMatrix backtransform(const Result& r, const DenseMatrix& Q) const;
 
 private:
-    /// 阶段 II 单节点投影（层并行调用；节点间块读写不相交，仅容器
-    /// 结构变更经 mapMutex_ 保护）。
-    void projectNode_(int64_t i, Result& res);
-
     const GaussianElimination& ge_;
     EigenpairSolver& eig_;
     int64_t N_;
 
-    // ---- 阶段 II 工作表（每趟 beginPass 清空）----
-    std::unordered_map<int64_t, DenseMatrix> mbar_;
-    std::unordered_map<int64_t, std::vector<int64_t>> mbarRow_;  // row → desc 列表
-    std::mutex mapMutex_, outMutex_;
-    // 本趟局部谱原始结果（spectralLevel 填充，选择后弃用）
-    std::vector<Vector> wAll_;
-    std::vector<DenseMatrix> vAll_;
+    /// μ̃ 右耦合存储（独立载体；beginPass 预建槽位，运行期无结构变更）。
+    MassCouplingStore store_;
+    /// reducedMassBlocks 追加锁（折叠任务的唯一共享写点）。
+    std::mutex outMutex_;
 
     std::map<std::string, double> stageTiming_;
-
-    int64_t key_(int64_t hi, int64_t lo) const { return hi * N_ + lo; }
 };
 
 } // namespace amls

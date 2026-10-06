@@ -36,9 +36,9 @@ public:
     using DenseMatrix = DefaultTraits::DenseMatrix;
 
     struct Solution {
-        Vector theta;       // 近似特征值（升序，nev 个）
-        DenseMatrix Z;      // M-归一近似特征向量（n × nev；recoverVectors=false 时为空）
-        int64_t p = 0;      // 降阶问题规模
+        Vector eigenvalues;       // 近似特征值（升序，nev 个）
+        DenseMatrix eigenvectors; // M-归一近似特征向量（n × nev；recoverVectors=false 时为空）
+        int64_t reducedSize = 0;  // 降阶问题规模 p
         std::map<std::string, double> timing;  // 秒
     };
 

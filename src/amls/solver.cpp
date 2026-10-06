@@ -1,14 +1,15 @@
 // AMLS 求解器协调器实现：四阶段流水线编排。
 //
 //   (1) step1 剖分与重排：|K|+|M| 邻接图递归二分 → 分割节点树 + 排列 P
-//   (2) step2a 高斯消去（GaussianElimination 单趟后序）：
-//       块分解 K̂ = LDLᵀ → W/X/Y 回代 → K Schur + M 同余更新（Hyun 式 2/5）
-//       —— 与截断无关，两趟阈值估计只跑一次
+//   (2) step2a 高斯消去（GaussianElimination）：
+//       N1 约束模态回代（一次分解 K̂_ii、逐祖先窄右端）→ N3 Mtemp →
+//       N4 K Schur + N5 M 更新（Mtemp 形式）——与截断无关
 //   (3) step2b 子空间缩聚（SubspaceCondensation）：
-//       并行局部谱（式 4，线程池）→ 后序投影（式 7/8、16/17）
+//       N7 局部谱 → N8 μ̃ 种子（MassCouplingStore）→ N9 折叠 / N10 传播
 //       M̃ 树块表（P4/P8），K̃ 对角（P3）
-//   (4) step3 降阶广义特征问题（式 21，稠密 dsygvd / dsygvx）
-//   (5) step4 恢复 z = L⁻ᵀ S q（可选；因子与 Φ_i 不释放）→ 反排列 + M-归一
+//   (4) step3 降阶广义特征问题（稠密 dsygvd / dsygvx）
+//   (5) step4 恢复 z_i = eigenvectors_i·q_i + Σ_a u(i,a)·z_a（纯 GEMM，
+//       可选；只需 u 与 eigenvectors 存活）→ 反排列 + M-归一
 //
 // 截断阈值 λ_cut = η·λ̂，λ̂ 为全局第 nev 个特征值的 Ritz 上界，
 // 由趟 A（固定小数目截断）的降阶解给出（Ritz 值从上方逼近真值，安全）。
@@ -18,10 +19,10 @@
 #include <cstdlib>
 #include <cmath>
 #include <iomanip>
-#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include <Eigen/Sparse>
@@ -69,29 +70,32 @@ DefaultTraits::SparseMatrix permuteSymmetric(
 }
 
 /// 装配降阶问题的稠密 M̃（对角块 = I，P8；非对角树块来自缩聚）。
-DefaultTraits::DenseMatrix assembleMprojDense(
-    const SubspaceCondensation::Result& r) {
-    DefaultTraits::DenseMatrix M =
-        DefaultTraits::DenseMatrix::Identity(r.p, r.p);
-    for (const auto& blk : r.mprojBlocks) {
-        const int64_t r0 = r.projOffset[static_cast<size_t>(blk.rowNode)];
-        const int64_t c0 = r.projOffset[static_cast<size_t>(blk.colNode)];
-        const int64_t m  = blk.block.rows(), n = blk.block.cols();
-        M.block(r0, c0, m, n) = blk.block;
-        M.block(c0, r0, n, m) = blk.block.transpose();
+DefaultTraits::DenseMatrix assembleReducedMassDense(
+    const SubspaceCondensation::Result& res) {
+    DefaultTraits::DenseMatrix reducedMass =
+        DefaultTraits::DenseMatrix::Identity(res.reducedSize, res.reducedSize);
+    for (const auto& blk : res.reducedMassBlocks) {
+        const int64_t r0 =
+            res.reducedOffset[static_cast<size_t>(blk.rowNode)];
+        const int64_t c0 =
+            res.reducedOffset[static_cast<size_t>(blk.colNode)];
+        const int64_t m = blk.block.rows(), n = blk.block.cols();
+        reducedMass.block(r0, c0, m, n) = blk.block;
+        reducedMass.block(c0, r0, n, m) = blk.block.transpose();
     }
-    return M;
+    return reducedMass;
 }
 
 /// K̃ 对角装配（P3：零计算，直接铺保留特征值）。
-void assembleKprojDiag(const SubspaceCondensation::Result& r,
-                       const SeparatorTree& tree,
-                       DefaultTraits::DenseMatrix& Kp) {
+void assembleReducedStiffnessDiag(const SubspaceCondensation::Result& res,
+                                  const SeparatorTree& tree,
+                                  DefaultTraits::DenseMatrix& reducedK) {
     for (int64_t i = 0; i < tree.nNodes(); ++i) {
-        const int64_t o = r.projOffset[static_cast<size_t>(i)];
-        const int64_t k = r.k[static_cast<size_t>(i)];
+        const int64_t o = res.reducedOffset[static_cast<size_t>(i)];
+        const int64_t k = res.keptModes[static_cast<size_t>(i)];
         for (int64_t j = 0; j < k; ++j)
-            Kp(o + j, o + j) = r.mu[static_cast<size_t>(i)][j];
+            reducedK(o + j, o + j) =
+                res.eigenvalues[static_cast<size_t>(i)][j];
     }
 }
 
@@ -143,41 +147,44 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
     blas::setNumThreads(1);
 
     auto solveProjected =
-        [&](const SubspaceCondensation::Result& r,
+        [&](const SubspaceCondensation::Result& res,
             int64_t want) -> std::pair<Vector, DenseMatrix> {
-        if (r.p <= 0)
+        if (res.reducedSize <= 0)
             throw std::runtime_error("降阶问题为空（所有节点截断为空）");
-        DenseMatrix Mp = assembleMprojDense(r);
-        DenseMatrix Kp = DenseMatrix::Zero(r.p, r.p);
-        assembleKprojDiag(r, tree, Kp);
-        Vector w;
-        DenseMatrix V;
-        want = std::min<int64_t>(want, r.p);
-        if (want < r.p)
-            dense.solveIndex(Kp, Mp, 1, want, w, V);
+        DenseMatrix reducedMass = assembleReducedMassDense(res);
+        DenseMatrix reducedK =
+            DenseMatrix::Zero(res.reducedSize, res.reducedSize);
+        assembleReducedStiffnessDiag(res, tree, reducedK);
+        Vector projectedEigenvalues;
+        DenseMatrix projectedEigenvectors;
+        want = std::min<int64_t>(want, res.reducedSize);
+        if (want < res.reducedSize)
+            dense.solveIndex(reducedK, reducedMass, 1, want,
+                             projectedEigenvalues, projectedEigenvectors);
         else
-            dense.solveAll(Kp, Mp, w, V);
-        return {w, V};
+            dense.solveAll(reducedK, reducedMass, projectedEigenvalues,
+                           projectedEigenvectors);
+        return {projectedEigenvalues, projectedEigenvectors};
     };
 
     // ---- step2a+2b 融合流水线（逐层：消去 → 局部谱 → 投影 → 释放）----
-    // 内存关键：列节点在第 l 层的祖先稠密耦合块 (a,i) 只在
-    // runLevel(l)…projectLevel(l) 之间存活，处理完该层立即 releaseNode
-    // 回收（只保留因子与 orig* 稀疏原块；GE 只依赖 orig*，可确定性重跑）。
-    // 趟 A 释放一切只留 λ̂；趟 B 重跑整个流水线（recoverVectors 时保留）。
+    // 内存关键：回代恢复只需 u 与 eigenvectors（纯 GEMM），耦合列/diag/
+    // Mtemp 在该层投影完成后即可释放（recoverVectors 时仅多保 u 列）。
+    // GE 只依赖 orig* 稀疏原块，趟间 resetBlocks 后可确定性重跑。
+    // 趟 A 释放一切只留 λ̂；趟 B 重跑整个流水线。
     GaussianElimination ge(reordered, tree);
     SubspaceCondensation cond(ge, eig);
 
     const int64_t nTreeNodes = tree.nNodes();
-    auto initRes = [&](SubspaceCondensation::Result& r) {
-        r = SubspaceCondensation::Result();
-        r.k.assign(static_cast<size_t>(nTreeNodes), 0);
-        r.mu.resize(static_cast<size_t>(nTreeNodes));
-        r.Z.resize(static_cast<size_t>(nTreeNodes));
-        r.projOffset.assign(static_cast<size_t>(nTreeNodes), 0);
+    auto initRes = [&](SubspaceCondensation::Result& res) {
+        res = SubspaceCondensation::Result();
+        res.keptModes.assign(static_cast<size_t>(nTreeNodes), 0);
+        res.eigenvalues.resize(static_cast<size_t>(nTreeNodes));
+        res.eigenvectors.resize(static_cast<size_t>(nTreeNodes));
+        res.reducedOffset.assign(static_cast<size_t>(nTreeNodes), 0);
     };
 
-    const bool keepFactors = optN.recoverVectors;
+    const bool keepVectors = optN.recoverVectors;
     // 调试开关：AMLS_NO_FUSE=1 走旧路径（GE 一趟跑完不释放 + cond.run 两阶段），
     // 用于对照融合流水线的数值与性能。
     const bool noFuse = std::getenv("AMLS_NO_FUSE") != nullptr;
@@ -195,9 +202,9 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
             return;
         }
         // 统一 DAG 路径（effThreads>1）：GE 节点内子任务 + 缩聚
-        // SPEC/f/g/h/rel 全部进同一 DagRunner——消去与缩聚跨阶段重叠
-        // （子树消去完成即可局部谱+投影），块内存随 rel(i) 边算边放，
-        // 500k 规模常驻块不再堆积。rel 只缩数据不删表项（桶链并发安全）。
+        // N7–N10/free 全部进同一 DagRunner——消去与缩聚跨阶段重叠
+        //（子树消去完成即可局部谱+折叠传播），块内存随释放任务边算边放。
+        // 释放只缩数据不删表项（预建键，无锁 find 并发安全）。
         const int effThreads =
             threads > 0 ? threads
                         : static_cast<int>(std::thread::hardware_concurrency());
@@ -205,28 +212,29 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
             ge.resetBlocks();
             cond.beginPass();
             DagRunner dag(effThreads);
-            GaussianElimination::GeDagTasks geInfo;
+            GaussianElimination::EliminationDagTasks geInfo;
             ge.buildDag(dag, geInfo);
-            cond.buildDag(dag, out, tr, geInfo, !keepFactors);
+            cond.buildDag(dag, out, tr, geInfo, !keepVectors);
             for (int64_t i = 0; i < nTreeNodes; ++i)
                 if (tree.node(i).children.empty())
-                    dag.ready(*geInfo.f[static_cast<size_t>(i)]);
+                    dag.ready(*geInfo.n1[static_cast<size_t>(i)]);
             dag.waitIdle();
             cond.finalize(out);
             return;
         }
         cond.beginPass();
-        // 每趟消去前清空动态块表：keepFactors（恢复向量）时趟 A 不释放，
-        // 不清理则趟 B 会在趟 A 残留块上累加（K̂ 失去正定性）。
+        // 每趟消去前清空动态块表：趟 A 残留块会让趟 B 的重跑变成在旧值
+        // 上累加（K̂ 失去正定性）。
         ge.resetBlocks();
         const int64_t nLevels = ge.maxLevel() + 1;
         for (int64_t l = 0; l < nLevels; ++l) {
             ge.runLevel(l, threads);
             cond.spectralLevel(tr, l, threads, out);
             cond.projectLevel(l, threads, out);
-            if (!keepFactors)
-                for (int64_t i : ge.levelNodes(l))
-                    ge.releaseNode(i);
+            // 回代恢复只需 u：diag/耦合列/Mtemp 一律释放，u 列按
+            // recoverVectors 保留。
+            for (int64_t i : ge.levelNodes(l))
+                ge.releaseNodeData(i, keepVectors);
             if (amls::log::global()->should_log(spdlog::level::debug)) {
                 int64_t zc, tc, zb, tb;
                 ge.zeroColStats(zc, tc, zb, tb);
@@ -253,18 +261,21 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
         int64_t k0 = std::max<int64_t>(
             4, (3 * optN.nev + tree.nNodes() - 1) / tree.nNodes());
         FixedCountTruncation<DefaultTraits> trA(k0);
-        SubspaceCondensation::Result ra;
+        SubspaceCondensation::Result resA;
         trace::mark("solver", "pass.A", 0);
-        runFused(trA, ra);
-        auto [wA, vA] = solveProjected(ra, std::min<int64_t>(optN.nev, ra.p));
-        (void)vA;
-        if (static_cast<int64_t>(wA.size()) < optN.nev)
+        runFused(trA, resA);
+        auto [passAEigenvalues, passAVectors] =
+            solveProjected(resA,
+                           std::min<int64_t>(optN.nev, resA.reducedSize));
+        (void)passAVectors;
+        if (static_cast<int64_t>(passAEigenvalues.size()) < optN.nev)
             throw std::runtime_error(
                 "趟 A 降阶问题规模不足（p < nev）；请减小 nLevels 或增大 leafSize");
-        const double lambdaHat = wA[optN.nev - 1];
+        const double lambdaHat = passAEigenvalues[optN.nev - 1];
         lambdaCut = optN.thresholdFactor * lambdaHat;
         if (optN.verbosity > 0)
-            std::cout << "[amls] 趟A: p0=" << ra.p << " λ̂=" << lambdaHat
+            std::cout << "[amls] 趟A: p0=" << resA.reducedSize
+                      << " λ̂=" << lambdaHat
                       << " λ_cut=" << lambdaCut << "\n";
 
         // 趟 B：阈值截断
@@ -280,58 +291,61 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
     sol.timing["gauss"] = geTime;
     sol.timing["condense"] = phase2 - geTime;
     if (optN.verbosity > 0) {
-        for (const auto& [k, v] : ge.lastTiming())
-            std::cout << "[amls]   消去." << k << "=" << v << "s\n";
+        for (const auto& [key, value] : ge.lastTiming())
+            std::cout << "[amls]   消去." << key << "=" << value << "s\n";
         {
             using GP = GaussianElimination::GePhaseProf;
-            GP& p = GaussianElimination::phaseProf();
-            std::cout << "[amls]   探针.schurKdiag=" << p.schurKdiag
-                      << " schurKcoup=" << p.schurKcoup
-                      << " congDiagT=" << p.congDiagT
-                      << " congDiagWX=" << p.congDiagWX
-                      << " congCoup=" << p.congCoup
-                      << " solveRhs=" << p.solveRhs
-                      << " expandT=" << p.solveExpandT << "\n";
+            GP& prof = GaussianElimination::phaseProf();
+            std::cout << "[amls]   探针.schurKdiag=" << prof.schurKdiag
+                      << " schurKcoup=" << prof.schurKcoup
+                      << " massDiagT1=" << prof.massDiagTerm1
+                      << " massDiagT2=" << prof.massDiagTerm2
+                      << " massCoupT1=" << prof.massCoupTerm1
+                      << " massCoupT2=" << prof.massCoupTerm2
+                      << " mtempBuild=" << prof.mtempBuild
+                      << " solveRhs=" << prof.solveRhs << "\n";
         }
-        for (const auto& [k, v] : cond.lastStageTiming())
-            std::cout << "[amls]   缩聚." << k << "=" << v << "s\n";
+        for (const auto& [key, value] : cond.lastStageTiming())
+            std::cout << "[amls]   缩聚." << key << "=" << value << "s\n";
     }
-    sol.p = res.p;
+    sol.reducedSize = res.reducedSize;
     if (optN.verbosity > 0)
-        std::cout << "[amls] 缩聚完成: p=" << res.p
+        std::cout << "[amls] 缩聚完成: p=" << res.reducedSize
                   << " 树节点=" << tree.nNodes() << "\n";
-    if (res.p > optN.denseProjectedMax && optN.verbosity > 0)
-        std::cout << "[amls] 警告: p=" << res.p
+    if (res.reducedSize > optN.denseProjectedMax && optN.verbosity > 0)
+        std::cout << "[amls] 警告: p=" << res.reducedSize
                   << " 超过 denseProjectedMax=" << optN.denseProjectedMax
                   << "（P12 切换点；仍用稠密求解）\n";
 
-    // ---- step3 降阶广义特征问题（式 21）----
-    const int64_t want = std::min<int64_t>(optN.nev, res.p);
-    auto [theta, Q] = solveProjected(res, want);
+    // ---- step3 降阶广义特征问题 ----
+    const int64_t want = std::min<int64_t>(optN.nev, res.reducedSize);
+    auto [eigenvalues, projectedVectors] = solveProjected(res, want);
     const auto t4 = Clock::now();
     sol.timing["reduced"] = seconds(t3, t4);
 
-    // ---- step4 恢复（可选）----
+    // ---- step4 恢复（可选；纯 GEMM 回代，只需 u 与 eigenvectors）----
     if (optN.recoverVectors) {
-        DenseMatrix z = cond.backtransform(res, Q);
+        DenseMatrix recovered = cond.backtransform(res, projectedVectors);
         const auto t5a = Clock::now();
         sol.timing["backtransform"] = seconds(t4, t5a);
 
         // 反排列 + M-归一
-        const int64_t ncols = z.cols();
-        DenseMatrix X(n, ncols);
+        const int64_t ncols = recovered.cols();
+        DenseMatrix eigenvectors(n, ncols);
         for (int64_t j = 0; j < n; ++j)
-            X.row(part.perm[static_cast<size_t>(j)]) = z.row(j);
+            eigenvectors.row(part.perm[static_cast<size_t>(j)]) =
+                recovered.row(j);
         for (int64_t c = 0; c < ncols; ++c) {
-            const double mz = X.col(c).dot(pencil->M * X.col(c));
-            X.col(c) /= std::sqrt(std::max(mz, 1e-300));
+            const double mz =
+                eigenvectors.col(c).dot(pencil->M * eigenvectors.col(c));
+            eigenvectors.col(c) /= std::sqrt(std::max(mz, 1e-300));
         }
-        sol.Z = std::move(X);
+        sol.eigenvectors = std::move(eigenvectors);
     } else {
         sol.timing["backtransform"] = 0.0;
     }
 
-    sol.theta = theta;
+    sol.eigenvalues = eigenvalues;
     trace::dump();
     return sol;
 }

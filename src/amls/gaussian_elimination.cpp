@@ -1,6 +1,6 @@
-// step 2a 实现：高斯消去（块分解 → 祖先方向回代求解 → Schur / 同余更新）。
-// 数值推导同 Gao et al. TOMS 2008 §2–§3；矩阵乘一律走 OpenBLAS gemm，
-// 转置经 CblasTrans 标志隐式完成（不物化转置副本）。
+// step 2a 实现：高斯消去（N1 约束模态回代 → N3 Mtemp → N4 K Schur / N5 M 更新）。
+// 全部块乘走 blockops 的 accumulateProduct / accumulateTransposedProduct
+// （OpenBLAS dgemm 后端），转置经 CblasTrans 标志隐式完成。
 #include "amls/gaussian_elimination.hpp"
 
 #include <algorithm>
@@ -9,7 +9,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
-#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -26,9 +25,11 @@ namespace amls {
 
 namespace {
 
+using Dense = DefaultTraits::DenseMatrix;
+using Sparse = DefaultTraits::SparseMatrix;
+
 /// 稠密块显著非零元占比（|v| > 1e-10·max|v|）。
-inline double significantFrac(
-    const Eigen::Ref<const DefaultTraits::DenseMatrix>& A) {
+inline double significantFrac(const Eigen::Ref<const Dense>& A) {
     if (A.size() == 0)
         return 0.0;
     double mx = 0.0;
@@ -44,8 +45,7 @@ inline double significantFrac(
 }
 
 /// 稠密块显著非零行数（|v| > 1e-10·max|v|）。
-inline int64_t significantRows(
-    const Eigen::Ref<const DefaultTraits::DenseMatrix>& A) {
+inline int64_t significantRows(const Eigen::Ref<const Dense>& A) {
     if (A.size() == 0)
         return 0;
     double mx = 0.0;
@@ -61,8 +61,7 @@ inline int64_t significantRows(
 }
 
 /// 稀疏块的非零列索引（升序）。
-inline std::vector<int32_t> nonzeroColIdx(
-    const DefaultTraits::SparseMatrix& A) {
+inline std::vector<int32_t> nonzeroColIdx(const Sparse& A) {
     std::vector<int32_t> idx;
     for (int64_t j = 0; j < A.cols(); ++j)
         if (A.col(j).nonZeros() > 0)
@@ -71,9 +70,8 @@ inline std::vector<int32_t> nonzeroColIdx(
 }
 
 /// 稠密块的精确非零列索引（升序）。右端零列经可逆回代仍为零列，
-/// 只需解非零列（X_a 非零列 = K_{i,a} 非零列的数学保证）。
-inline std::vector<int32_t> nonzeroColIdx(
-    const Eigen::Ref<const DefaultTraits::DenseMatrix>& A) {
+/// 只需解非零列（u(i,a) 非零列 = K_{i,a} 非零列的数学保证）。
+inline std::vector<int32_t> nonzeroColIdx(const Eigen::Ref<const Dense>& A) {
     std::vector<int32_t> idx;
     for (int64_t j = 0; j < A.cols(); ++j)
         for (int64_t r = 0; r < A.rows(); ++r)
@@ -84,37 +82,19 @@ inline std::vector<int32_t> nonzeroColIdx(
     return idx;
 }
 
-/// 列 gather：B(:,c) = A(:,idx[c])。
-inline DefaultTraits::DenseMatrix gatherCols(
-    const DefaultTraits::DenseMatrix& A, const std::vector<int32_t>& idx) {
-    DefaultTraits::DenseMatrix B(A.rows(), static_cast<int64_t>(idx.size()));
-    for (int64_t c = 0; c < static_cast<int64_t>(idx.size()); ++c)
-        B.col(c) = A.col(idx[static_cast<size_t>(c)]);
-    return B;
-}
-
-/// 列散布：full(:,idx[c]) = S(:,c)（full 预先置零）。
-inline void scatterCols(DefaultTraits::DenseMatrix& full,
-                        const DefaultTraits::DenseMatrix& S,
-                        const std::vector<int32_t>& idx) {
-    for (int64_t c = 0; c < static_cast<int64_t>(idx.size()); ++c)
-        full.col(idx[static_cast<size_t>(c)]) = S.col(c);
-}
-
 /// 稀疏块的非零行位图。
-inline ColMask rowMaskOf(const DefaultTraits::SparseMatrix& A) {
+inline ColMask rowMaskOf(const Sparse& A) {
     ColMask m;
     m.init(A.rows());
     for (int64_t c = 0; c < A.cols(); ++c)
-        for (typename DefaultTraits::SparseMatrix::InnerIterator it(A,
-                 static_cast<DefaultTraits::Index>(c));
+        for (Sparse::InnerIterator it(A, static_cast<DefaultTraits::Index>(c));
              it; ++it)
             m.set(it.row());
     return m;
 }
 
 /// 稀疏块的非零列位图。
-inline ColMask colMaskOf(const DefaultTraits::SparseMatrix& A) {
+inline ColMask colMaskOf(const Sparse& A) {
     ColMask m;
     m.init(A.cols());
     for (int64_t c = 0; c < A.cols(); ++c)
@@ -161,6 +141,14 @@ GaussianElimination::GaussianElimination(
     mCoupD_.reserve(static_cast<size_t>(coupKeys));
     kDiag_.reserve(static_cast<size_t>(N_) + 1);
     mDiag_.reserve(static_cast<size_t>(N_) + 1);
+    // u / Mtemp 键预建（运行期只写值，无结构变更）
+    constraintModes_.reserve(static_cast<size_t>(coupKeys));
+    temporaryMass_.reserve(static_cast<size_t>(coupKeys));
+    for (const int64_t i : order_)
+        for (const int64_t a : tree_.ancestors(i)) {
+            constraintModes_.emplace(modeKey_(i, a), ColComp());
+            temporaryMass_.emplace(modeKey_(i, a), ColComp());
+        }
 }
 
 DefaultTraits::SparseMatrix GaussianElimination::sparseBlock_(
@@ -170,7 +158,7 @@ DefaultTraits::SparseMatrix GaussianElimination::sparseBlock_(
     std::vector<Eigen::Triplet<double, Index>> trips;
     trips.reserve(static_cast<size_t>(m));
     for (Index c = c0; c < c1; ++c) {
-        for (typename SparseMatrix::InnerIterator it(A, c); it; ++it) {
+        for (SparseMatrix::InnerIterator it(A, c); it; ++it) {
             const Index r = it.row();
             if (r >= r0 && r < r1)
                 trips.emplace_back(r - r0, c - c0, it.value());
@@ -215,7 +203,7 @@ void GaussianElimination::precompute_() {
         }
     }
 
-    // 符号填充 pass：精确预算全部耦合块的终态列模式（表出生即终态）
+    // 符号填充 pass：精确预算全部耦合块的终态列/行模式
     symbolicFill_();
 }
 
@@ -237,46 +225,43 @@ void GaussianElimination::symbolicFill_() {
             const int64_t hi = anc[u];
             const ColMask& rHi  = rowK.at(key_(hi, i));
             const ColMask& rMhi = rowM.at(key_(hi, i));
-            if (rHi.count() == 0) continue;   // K_{hi,i}≡0，无积
             for (size_t v = 0; v < u; ++v) {  // lo：更低祖先
                 const int64_t lo = anc[v];
                 const int64_t k = key_(hi, lo);
                 const ColMask& rKlo = rowK.at(key_(lo, i));
-                if (rKlo.count() != 0) {
-                    // K̄_{hi,lo} −= K_{hi,i}·X：列来自 X 的非零列
-                    // = K_{i,lo} 的非零列 = K_{lo,i} 的非零行
-                    colK[k].merge(rKlo);
-                    rowK[k].merge(rHi);   // 积的行 ⊆ K_{hi,i} 的行
-                    // M̄ 的 T2=(K_{lo,i}Y_hi)ᵀ 与 T3=K_{hi,i}·W·X_lo 的列
-                    // 同为 K 行驱动（X/W 不扩展零列结构）
-                    colM[k].merge(rKlo);
-                    rowM[k].merge(rHi);
-                    if (rMhi.count() != 0)
-                        rowM[k].merge(rMhi);  // T2 的 hi 空间行由 M 行驱动
-                }
                 const ColMask& rMlo = rowM.at(key_(lo, i));
-                if (rMlo.count() != 0) {
-                    // T1 = K_{hi,i}·Y_lo 的列由 M 行驱动
+                if (rKlo.count() != 0) {
+                    if (rHi.count() != 0) {
+                        // N4：K̄(hi,lo) += K_{hi,i}·u(i,lo)
+                        // 积列 = u(i,lo) 列 = K_{lo,i} 非零行；行 ⊆ K_{hi,i} 行
+                        colK[k].merge(rKlo);
+                        rowK[k].merge(rHi);
+                        // N5 第二项 u(i,hi)ᵀ·Mtemp(i,lo) 的 K 部分列
+                        colM[k].merge(rKlo);
+                        rowM[k].merge(rHi);
+                    }
+                    if (rMhi.count() != 0) {
+                        // N5 第一项：M̄(hi,lo) += M_{hi,i}·u(i,lo)
+                        // 积列 = u(i,lo) 列；行 ⊆ M_{hi,i} 行
+                        colM[k].merge(rKlo);
+                        rowM[k].merge(rMhi);
+                    }
+                }
+                if (rMlo.count() != 0 && rHi.count() != 0) {
+                    // N5 第二项的 M 部分列（Mtemp 列 = rowK ∪ rowM）
                     colM[k].merge(rMlo);
                     rowM[k].merge(rHi);
                 }
             }
         }
     }
-    // 仅保留将成为出生表的列模式（行模式已完成使命）
+    // 列模式 = 耦合块出生表；行模式保留供 MassCouplingStore 预算 μ̃ 列模式
     for (auto& [k, m] : colK)
         if (m.count() != 0) kColFinal_[k] = std::move(m);
     for (auto& [k, m] : colM)
         if (m.count() != 0) mColFinal_[k] = std::move(m);
-}
-
-const GaussianElimination::SparseMatrix&
-GaussianElimination::origKCoupling(int64_t a, int64_t lo) const {
-    return origK_(a, lo);
-}
-const GaussianElimination::SparseMatrix&
-GaussianElimination::origMCoupling(int64_t a, int64_t lo) const {
-    return origM_(a, lo);
+    rowKFinal_ = std::move(rowK);
+    rowMFinal_ = std::move(rowM);
 }
 
 const GaussianElimination::SparseMatrix& GaussianElimination::origK_(
@@ -353,7 +338,7 @@ ColComp& GaussianElimination::kCoupTarget_(int64_t hi, int64_t lo) {
     const int64_t k = key_(hi, lo);
     // 热路径：表已 reserve（构造时按符号结构预算），无锁查找返回引用；
     // 引用在运行期稳定（无 rehash、无同键 erase——erase 只在趟间
-    // releaseNode/resetBlocks，彼时无并发消去）。仅创建走 structMutex_。
+    // releaseNodeData/resetBlocks，彼时无并发消去）。仅创建走 structMutex_。
     if (auto it = kCoupD_.find(k); it != kCoupD_.end())
         return it->second;
     std::lock_guard<std::mutex> lk(structMutex_);
@@ -372,7 +357,7 @@ ColComp& GaussianElimination::kCoupTarget_(int64_t hi, int64_t lo) {
                                      fi->second.count());
         if (!blk.ident) blk.cols = fi->second.indices();
         // 注意：不能 erase(fi)——趟 A/B（twoPass）会重跑整个流水线，
-        // 表需保留供二次物化（GE 可重入，releaseNode 已清空全部块）。
+        // 表需保留供二次物化。
         injectOrig_(blk, origK_(hi, lo), nMiss_);
     }
     auto res = kCoupD_.emplace(k, std::move(blk));
@@ -397,7 +382,6 @@ ColComp& GaussianElimination::mCoupTarget_(int64_t hi, int64_t lo) {
         blk.data = DenseMatrix::Zero(size_[static_cast<size_t>(hi)],
                                      fi->second.count());
         if (!blk.ident) blk.cols = fi->second.indices();
-        // 表保留供 twoPass 重跑（同 kCoupTarget_）
         injectOrig_(blk, origM_(hi, lo), nMiss_);
     }
     auto res = mCoupD_.emplace(k, std::move(blk));
@@ -448,15 +432,18 @@ std::mutex& GaussianElimination::keyLock_(int64_t key) {
                 .first->second;
 }
 
-void GaussianElimination::solveFactor(int64_t i, const DenseMatrix& B,
-                                      DenseMatrix& X) const {
+void GaussianElimination::solveWithFactor_(int64_t i, const DenseMatrix& rhs,
+                                           DenseMatrix& solution) const {
     if (sparseFactors_[static_cast<size_t>(i)])
-        sparseFactors_[static_cast<size_t>(i)]->solveWithFactor(B, X);
+        sparseFactors_[static_cast<size_t>(i)]->solveWithFactor(rhs, solution);
     else
-        denseFactors_[static_cast<size_t>(i)]->solveWithFactor(B, X);
+        denseFactors_[static_cast<size_t>(i)]->solveWithFactor(rhs, solution);
 }
 
-void GaussianElimination::factorNode_(int64_t i, ElimData& d) {
+// ---------------------------------------------------------------------------
+// N1：约束模态 u(i,a) = Ψ(i,a) = −K̂_ii⁻¹·K_{i,a}
+// ---------------------------------------------------------------------------
+void GaussianElimination::computeConstraintModes(int64_t i) {
     using Clock = std::chrono::steady_clock;
     const bool leaf = isLeaf(i);
     const char* who = leaf ? ".leaf" : ".sep";
@@ -468,28 +455,35 @@ void GaussianElimination::factorNode_(int64_t i, ElimData& d) {
             std::make_unique<EigenSimplicialLDLTSolver<DefaultTraits>>();
         sparseFactors_[static_cast<size_t>(i)]->factorize(origKDiag_.at(i));
     } else {
-        denseFactors_[static_cast<size_t>(i)] =
-            std::make_unique<DenseLDLTSolver<DefaultTraits>>();
+        // diag 块定稿于全部后代的 N4/N5（依赖边保证）；确保诞生
+        //（无后代写入时 = 原始稀疏块的稠密化）。M 对角同理（N7 消费）。
+        ColComp& kd = kDiagTarget_(i);
+        (void)mDiagTarget_(i);
         if (static const char* dump = std::getenv("AMLS_DUMP_KDIAG");
             dump != nullptr) {
             const std::string f =
                 std::string("kdiag_") + dump + "_" +
                 std::to_string(i) + ".bin";
             std::ofstream os(f, std::ios::binary);
-            const DenseMatrix& kd = kDiagTarget_(i).data;
-            const int64_t r = kd.rows();
+            const DenseMatrix& kdd = kd.data;
+            const int64_t r = kdd.rows();
             os.write(reinterpret_cast<const char*>(&r), sizeof(r));
-            os.write(reinterpret_cast<const char*>(kd.data()),
+            os.write(reinterpret_cast<const char*>(kdd.data()),
                      static_cast<std::streamsize>(r * r) *
                          static_cast<std::streamsize>(sizeof(double)));
         }
-        try {
-            denseFactors_[static_cast<size_t>(i)]->factorizeDense(
-                kDiagTarget_(i).data);
-        } catch (const std::exception& e) {
-            AMLS_LOG_ERROR("[ge] 节点 {} (n={}, leaf={}) LDL 失败: {}", i,
-                           size_[static_cast<size_t>(i)], leaf, e.what());
-            throw;
+        // 根节点无祖先：u 无消费者、回代恢复用存储的 u 而非因子——
+        // 分解毫无意义，跳过（省掉全图最大一次稠密 LDL）。
+        if (!tree_.ancestors(i).empty()) {
+            denseFactors_[static_cast<size_t>(i)] =
+                std::make_unique<DenseLDLTSolver<DefaultTraits>>();
+            try {
+                denseFactors_[static_cast<size_t>(i)]->factorizeDense(kd.data);
+            } catch (const std::exception& e) {
+                AMLS_LOG_ERROR("[ge] 节点 {} (n={}, leaf={}) LDL 失败: {}", i,
+                               size_[static_cast<size_t>(i)], leaf, e.what());
+                throw;
+            }
         }
     }
     const auto t1 = Clock::now();
@@ -500,100 +494,300 @@ void GaussianElimination::factorNode_(int64_t i, ElimData& d) {
         timing_[std::string("factor") + who] += dt;
     }
 
-    if (tree_.ancestors(i).empty())
-        return;   // 根节点：消去即完成（同余更新无接收方，W 亦不需要）
+    const std::vector<int64_t> anc = tree_.ancestors(i);
+    if (anc.empty()) {
+        if (stats)
+            recordNodeStat_(i);
+        return;   // 根节点：无 u 需求
+    }
 
-    // 注：原在此缓存 d.W = M̂（T3 右乘因子）。已改为 makeWX_ 首次需要时
-    // 直接物化 Mtemp W̃ = K̂⁻¹M̂（一次宽回代），供 WX_a = W̃·X_a 与
-    // 缩聚 f 的 WMz = W̃·Z_i 共同复用——M̂ 本身不再缓存。
+    // ---- 2. 逐祖先窄右端回代（右端零列跳过：u 的非零列 = K_{i,a} 非零列）
+    // 右端 K_{i,a} = (a,i) 块ᵀ：叶由稀疏块非零行直接构造窄右端（免全物化
+    // 转置）；分割节点 expandT 后 scan 非零列再 gather。
+    auto& prof = phaseProf();
+    for (const int64_t a : anc) {
+        const auto tp0 = Clock::now();
+        const int64_t na = size_[static_cast<size_t>(a)];
+        ColComp& u = constraintModes_.at(modeKey_(i, a));   // 预建键
+        u.full = na;
+        u.ident = false;
+        u.cols.clear();
+        u.data.resize(0, 0);
+        if (leaf) {
+            // 右端 = K_{i,a} 的非零列 = (a,i) 稀疏块的非零行
+            const SparseMatrix& block = origK_(a, i);
+            ColMask mk;
+            mk.init(na);
+            for (int64_t c = 0; c < block.cols(); ++c)
+                for (SparseMatrix::InnerIterator it(
+                         block, static_cast<Index>(c));
+                     it; ++it)
+                    mk.set(it.row());
+            auto idx = mk.indices();
+            if (!idx.empty()) {
+                DenseMatrix rhs =
+                    DenseMatrix::Zero(size_[static_cast<size_t>(i)],
+                                      static_cast<int64_t>(idx.size()));
+                std::vector<int64_t> pos(static_cast<size_t>(na), -1);
+                for (int64_t p = 0; p < static_cast<int64_t>(idx.size()); ++p)
+                    pos[static_cast<size_t>(idx[static_cast<size_t>(p)])] = p;
+                for (int64_t c = 0; c < block.cols(); ++c)
+                    for (SparseMatrix::InnerIterator it(
+                             block, static_cast<Index>(c));
+                         it; ++it)
+                        rhs(c, pos[static_cast<size_t>(it.row())]) = it.value();
+                u.cols = std::move(idx);
+                solveWithFactor_(i, rhs, u.data);
+                u.data *= -1.0;   // Ψ = −K̂⁻¹K
+            }
+        } else {
+            const DenseMatrix transposed =
+                blockops::expandTranspose(kCoup_(a, i));
+            auto idx = nonzeroColIdx(transposed);
+            if (!idx.empty()) {
+                DenseMatrix rhs(size_[static_cast<size_t>(i)],
+                                static_cast<int64_t>(idx.size()));
+                for (int64_t p = 0; p < static_cast<int64_t>(idx.size()); ++p)
+                    rhs.col(p) = transposed.col(idx[static_cast<size_t>(p)]);
+                u.cols = std::move(idx);
+                solveWithFactor_(i, rhs, u.data);
+                u.data *= -1.0;   // Ψ = −K̂⁻¹K
+            }
+        }
+        profAdd(prof.solveRhs,
+                std::chrono::duration<double>(Clock::now() - tp0).count());
+
+        if (stats) {
+            GeBlockStat bs;
+            bs.node = i;
+            bs.leaf = leaf;
+            bs.level = level_[static_cast<size_t>(i)];
+            bs.anc  = a;
+            bs.rows = na;
+            bs.cols = size_[static_cast<size_t>(i)];
+            if (leaf) {
+                bs.nonzeroCols =
+                    static_cast<int64_t>(nonzeroColIdx(origK_(a, i)).size());
+                bs.kFrac = significantFrac(DenseMatrix(origK_(a, i)));
+            } else {
+                const ColComp& kb = kCoup_(a, i);
+                bs.nonzeroCols = kb.storedCols();
+                bs.kFrac = significantFrac(kb.data);
+            }
+            bs.uNZRows = significantRows(u.data);
+            bs.uFrac = significantFrac(u.data);
+            std::lock_guard<std::mutex> lk(statsMutex_);
+            stats->blocks.push_back(bs);
+        }
+    }
+    // ---- 3. 因子使命完成（N3–N5、缩聚、回代恢复均不再需要 K̂⁻¹）----
+    sparseFactors_[static_cast<size_t>(i)].reset();
+    denseFactors_[static_cast<size_t>(i)].reset();
+    if (stats)
+        recordNodeStat_(i);
+    {
+        const double dt = std::chrono::duration<double>(Clock::now() - t1)
+                              .count();
+        std::lock_guard<std::mutex> lk(statsMutex_);
+        timing_["solve"] += dt;
+        timing_[std::string("solve") + who] += dt;
+    }
 }
 
-void GaussianElimination::solveXYAnc_(int64_t i, ElimData& d, int64_t a,
-                                      bool leaf) {
+// ---------------------------------------------------------------------------
+// N3：Mtemp(i,a) = M_{i,a} + M_ii·u(i,a)（列 = u 列 ∪ M 耦合行模式）
+// ---------------------------------------------------------------------------
+void GaussianElimination::buildTemporaryMass(int64_t i) {
     using Clock = std::chrono::steady_clock;
-    const int64_t na = size_[static_cast<size_t>(a)];
-    auto tp0 = Clock::now();
-    auto& prof = phaseProf();
-    // 右端零列跳过：X_a（Y_a）的非零列 = K_{i,a}（M_{i,a}）的非零列
-    // （K̂⁻¹ 可逆保零列）。叶右端直接由稀疏块非零行构造窄右端（免
-    // expandT 全物化）；分割节点右端 expandT 后 scan 非零列再 gather。
-    auto buildSub = [&](const SparseMatrix& A, bool isK) -> bool {
-        // A = 块 (a,i)（na×m）：右端 K_{i,a} = Aᵀ（m×na）的非零列
-        // = A 的非零行。直接构造窄右端 Bsub(:,p) = Aᵀ(:,idx[p])。
-        ColMask mk;
-        mk.init(na);
-        for (int64_t c = 0; c < A.cols(); ++c)
-            for (typename SparseMatrix::InnerIterator it(
-                     A, static_cast<Index>(c));
-                 it; ++it)
-                mk.set(it.row());
-        auto idx = mk.indices();
-        auto& out = isK ? d.X[a] : d.Y[a];
-        out.full = na;
-        out.ident = false;
-        out.cols = idx;
-        out.data.resize(0, 0);
-        if (idx.empty()) return true;   // 全零右端 → 空表解
-        DenseMatrix Bsub =
-            DenseMatrix::Zero(size_[static_cast<size_t>(i)],
-                              static_cast<int64_t>(idx.size()));
-        std::vector<int64_t> pos(static_cast<size_t>(na), -1);
-        for (int64_t p = 0; p < static_cast<int64_t>(idx.size()); ++p)
-            pos[static_cast<size_t>(idx[static_cast<size_t>(p)])] = p;
-        for (int64_t c = 0; c < A.cols(); ++c)
-            for (typename SparseMatrix::InnerIterator it(
-                     A, static_cast<Index>(c));
-                 it; ++it)
-                Bsub(c, pos[static_cast<size_t>(it.row())]) = it.value();
-        solveFactor(i, Bsub, out.data);
-        return true;
-    };
-    auto buildSubDense = [&](const ColComp& Cc, bool isK) {
-        // Cc = (a,i) 列压缩块：右端 = expandT（m×na）后 scan 非零列。
-        const DenseMatrix R = ops().expandT(Cc);
-        auto idx = nonzeroColIdx(R);
-        auto& out = isK ? d.X[a] : d.Y[a];
-        out.full = na;
-        out.ident = false;
-        out.cols = idx;
-        out.data.resize(0, 0);
-        if (idx.empty()) return;
-        solveFactor(i, gatherCols(R, idx), out.data);
-    };
-    if (leaf) {
-        buildSub(origK_(a, i), true);
-        buildSub(origM_(a, i), false);
-    } else {
-        buildSubDense(kCoup_(a, i), true);
-        buildSubDense(mCoup_(a, i), false);
-    }
-    profAdd(prof.solveRhs,
-            std::chrono::duration<double>(Clock::now() - tp0).count());
+    const std::vector<int64_t> anc = tree_.ancestors(i);
+    if (anc.empty())
+        return;
+    const bool leaf = isLeaf(i);
+    const char* who = leaf ? ".leaf" : ".sep";
+    const auto t0 = Clock::now();
+    const int64_t ni = size_[static_cast<size_t>(i)];
 
-    // ---- 块统计：耦合块列稀疏性 + 解的实际密度 ----
-    if (stats) {
-        GeBlockStat bs;
-        bs.node = i;
-        bs.leaf = leaf;
-        bs.level = level_[static_cast<size_t>(i)];
-        bs.anc  = a;
-        bs.rows = na;
-        bs.cols = size_[static_cast<size_t>(i)];
-        if (leaf) {
-            bs.nonzeroCols = static_cast<int64_t>(nonzeroColIdx(origK_(a, i)).size());
-            bs.kFrac = significantFrac(DenseMatrix(origK_(a, i)));
-        } else {
-            const ColComp& kb = kCoup_(a, i);
-            bs.nonzeroCols = kb.storedCols();
-            bs.kFrac = significantFrac(kb.data);
+    for (const int64_t a : anc) {
+        const auto tp0 = Clock::now();
+        const int64_t na = size_[static_cast<size_t>(a)];
+        const ColComp& u = constraintModes_.at(modeKey_(i, a));
+        // M_{i,a} 稠密物化（n_i × n_a 全）：叶 = 稀疏转置；分割 = expandT
+        DenseMatrix mCouplingT =
+            leaf ? blockops::expandTranspose(origM_(a, i))
+                 : blockops::expandTranspose(mCoup_(a, i));
+        // M_ii·u：M_ii = 叶稀疏原块 / 分割节点消去后稠密对角
+        DenseMatrix product;
+        if (!u.empty()) {
+            if (leaf)
+                product = DenseMatrix(origMDiag_.at(i) * u.data);
+            else
+                blas::gemm0(CblasNoTrans, CblasNoTrans, mDiagTarget_(i).data,
+                            u.data, product);
         }
-        bs.xNZRows = significantRows(d.X.at(a).data);
-        bs.yNZRows = significantRows(d.Y.at(a).data);
-        bs.xFrac = significantFrac(d.X.at(a).data);
-        bs.yFrac = significantFrac(d.Y.at(a).data);
-        std::lock_guard<std::mutex> lk(statsMutex_);
-        stats->blocks.push_back(bs);
+        // 列 = u.cols ∪ M_{i,a} 非零列（升序并集；两集合可重叠——
+        // 分割节点的 M 耦合更新列恰落进 u.cols，merge 会产生重复列，
+        // 下游按 cols 驱动的 gather/散布会对同一物理列累加两次）
+        const auto mCols = nonzeroColIdx(mCouplingT);
+        std::vector<int32_t> cols;
+        cols.reserve(u.cols.size() + mCols.size());
+        std::set_union(u.cols.begin(), u.cols.end(), mCols.begin(),
+                       mCols.end(), std::back_inserter(cols));
+        ColComp& mt = temporaryMass_.at(modeKey_(i, a));   // 预建键
+        mt.full = na;
+        mt.ident = false;   // 作为 C 操作数时经 cols 驱动求和维，恒非 ident
+        mt.cols = cols;
+        mt.data = DenseMatrix::Zero(ni, static_cast<int64_t>(cols.size()));
+        for (int64_t p = 0; p < static_cast<int64_t>(cols.size()); ++p) {
+            const int32_t col = cols[static_cast<size_t>(p)];
+            mt.data.col(p) = mCouplingT.col(col);
+            if (!u.empty()) {
+                const auto it = std::lower_bound(u.cols.begin(), u.cols.end(),
+                                                 col);
+                if (it != u.cols.end() && *it == col)
+                    mt.data.col(p) += product.col(it - u.cols.begin());
+            }
+        }
+        profAdd(phaseProf().mtempBuild,
+                std::chrono::duration<double>(Clock::now() - tp0).count());
     }
+    const double dt =
+        std::chrono::duration<double>(Clock::now() - t0).count();
+    std::lock_guard<std::mutex> lk(statsMutex_);
+    timing_["mtemp"] += dt;
+    timing_[std::string("mtemp") + who] += dt;
+}
+
+// ---------------------------------------------------------------------------
+// N4：K 单边 Schur 更新（A += B·C 规范形态）
+// ---------------------------------------------------------------------------
+void GaussianElimination::stiffnessDiagUpdate(int64_t i, int64_t a) {
+    auto& prof = phaseProf();
+    const auto tp0 = std::chrono::steady_clock::now();
+    const ColComp& u = constraintModes_.at(modeKey_(i, a));
+    // 尾部大任务在就绪队列空闸下临时放开 BLAS 多线程。
+    const double gf =
+        2.0 * size_[static_cast<size_t>(a)] * size_[static_cast<size_t>(i)] *
+        u.storedCols() / 1e9;
+    auto mb = blas::maybeBudget(gf);
+    std::lock_guard<std::mutex> lk(keyLock_(a));
+    ColComp& tgt = kDiagTarget_(a);
+    if (isLeaf(i))
+        blockops::accumulateProduct(tgt, origK_(a, i), u);
+    else
+        blockops::accumulateProduct(tgt, kCoup_(a, i), u);
+    profAdd(prof.schurKdiag,
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - tp0).count());
+}
+
+void GaussianElimination::stiffnessCoupUpdate(int64_t i, int64_t hi,
+                                              int64_t lo) {
+    auto& prof = phaseProf();
+    const auto tp0 = std::chrono::steady_clock::now();
+    const ColComp& u = constraintModes_.at(modeKey_(i, lo));
+    const double gf =
+        2.0 * size_[static_cast<size_t>(hi)] * size_[static_cast<size_t>(i)] *
+        u.storedCols() / 1e9;
+    auto mb = blas::maybeBudget(gf);
+    std::lock_guard<std::mutex> lk(keyLock_(key_(hi, lo)));
+    ColComp& tgt = kCoupTarget_(hi, lo);
+    if (isLeaf(i))
+        blockops::accumulateProduct(tgt, origK_(hi, i), u);
+    else
+        blockops::accumulateProduct(tgt, kCoup_(hi, i), u);
+    profAdd(prof.schurKcoup,
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - tp0).count());
+}
+
+// ---------------------------------------------------------------------------
+// N5：M 更新（Mtemp 形式：M̄ += M·u + uᵀ·Mtemp，三重积消失）
+// ---------------------------------------------------------------------------
+void GaussianElimination::massDiagUpdate(int64_t i, int64_t a) {
+    auto& prof = phaseProf();
+    const auto tp0 = std::chrono::steady_clock::now();
+    const ColComp& u = constraintModes_.at(modeKey_(i, a));
+    const ColComp& mt = temporaryMass_.at(modeKey_(i, a));
+    const double gf =
+        2.0 * size_[static_cast<size_t>(i)] *
+        (size_[static_cast<size_t>(a)] * u.storedCols() +
+         u.storedCols() * mt.storedCols()) / 1e9;
+    auto mb = blas::maybeBudget(gf);
+    std::lock_guard<std::mutex> lk(keyLock_(a));
+    ColComp& tgt = mDiagTarget_(a);
+    const auto tp1 = std::chrono::steady_clock::now();
+    if (isLeaf(i))
+        blockops::accumulateProduct(tgt, origM_(a, i), u);
+    else
+        blockops::accumulateProduct(tgt, mCoup_(a, i), u);
+    const auto tp2 = std::chrono::steady_clock::now();
+    blockops::accumulateTransposedProduct(tgt, u, mt);
+    const auto tp3 = std::chrono::steady_clock::now();
+    profAdd(prof.massDiagTerm1,
+            std::chrono::duration<double>(tp2 - tp1).count());
+    profAdd(prof.massDiagTerm2,
+            std::chrono::duration<double>(tp3 - tp2).count());
+}
+
+void GaussianElimination::massCoupUpdate(int64_t i, int64_t hi, int64_t lo) {
+    auto& prof = phaseProf();
+    const auto tp0 = std::chrono::steady_clock::now();
+    const ColComp& uLo = constraintModes_.at(modeKey_(i, lo));
+    const ColComp& uHi = constraintModes_.at(modeKey_(i, hi));
+    const ColComp& mtLo = temporaryMass_.at(modeKey_(i, lo));
+    const double gf =
+        2.0 * size_[static_cast<size_t>(i)] *
+        (size_[static_cast<size_t>(hi)] * uLo.storedCols() +
+         uHi.storedCols() * mtLo.storedCols()) / 1e9;
+    auto mb = blas::maybeBudget(gf);
+    std::lock_guard<std::mutex> lk(keyLock_(key_(hi, lo)));
+    ColComp& tgt = mCoupTarget_(hi, lo);
+    const auto tp1 = std::chrono::steady_clock::now();
+    if (isLeaf(i))
+        blockops::accumulateProduct(tgt, origM_(hi, i), uLo);
+    else
+        blockops::accumulateProduct(tgt, mCoup_(hi, i), uLo);
+    const auto tp2 = std::chrono::steady_clock::now();
+    blockops::accumulateTransposedProduct(tgt, uHi, mtLo);
+    const auto tp3 = std::chrono::steady_clock::now();
+    profAdd(prof.massCoupTerm1,
+            std::chrono::duration<double>(tp2 - tp1).count());
+    profAdd(prof.massCoupTerm2,
+            std::chrono::duration<double>(tp3 - tp2).count());
+}
+
+// ---------------------------------------------------------------------------
+// 释放（统一 DAG 内"边算边放"：值缩容不动结构，与无锁 find 并发安全）
+// ---------------------------------------------------------------------------
+void GaussianElimination::releaseCouplingColumn(int64_t i) const {
+    for (const int64_t a : tree_.ancestors(i)) {
+        const int64_t k = key_(a, i);
+        if (auto it = kCoupD_.find(k); it != kCoupD_.end())
+            it->second.shrink();
+        if (auto it = mCoupD_.find(k); it != mCoupD_.end())
+            it->second.shrink();
+    }
+}
+
+void GaussianElimination::releaseDiagonalBlocks(int64_t i) const {
+    if (auto it = kDiag_.find(i); it != kDiag_.end())
+        it->second.shrink();
+    if (auto it = mDiag_.find(i); it != mDiag_.end())
+        it->second.shrink();
+}
+
+void GaussianElimination::releaseTemporaryMass(int64_t i) const {
+    for (const int64_t a : tree_.ancestors(i))
+        if (auto it = temporaryMass_.find(modeKey_(i, a));
+            it != temporaryMass_.end())
+            it->second.shrink();
+}
+
+void GaussianElimination::releaseConstraintModes(int64_t i) const {
+    for (const int64_t a : tree_.ancestors(i))
+        if (auto it = constraintModes_.find(modeKey_(i, a));
+            it != constraintModes_.end())
+            it->second.shrink();
 }
 
 void GaussianElimination::recordNodeStat_(int64_t i) {
@@ -616,236 +810,41 @@ void GaussianElimination::recordNodeStat_(int64_t i) {
     stats->nodes.push_back(std::move(ns));
 }
 
-void GaussianElimination::solveXY_(int64_t i, ElimData& d) {
+void GaussianElimination::eliminateNode_(int64_t i) {
     using Clock = std::chrono::steady_clock;
-    const bool leaf = isLeaf(i);
-    const char* who = leaf ? ".leaf" : ".sep";
     const std::vector<int64_t> anc = tree_.ancestors(i);
+    computeConstraintModes(i);
+    buildTemporaryMass(i);
     if (anc.empty())
         return;
-    const auto t1 = Clock::now();
-
-    // ---- 2+3. W/X/Y 回代 ----
-    // W = K̂_ii⁻¹ M̂_ii（P5/P11），X_a = K̂_ii⁻¹ K_{i,a}，Y_a = K̂_ii⁻¹ M_{i,a}
-    // （K_{i,a} = K_{a,i}ᵀ，经算子 expandT 物化：回代右端需实体矩阵）。
-    // 注：合并宽右端单次求解实测更慢（Eigen 宽稠密右端三角回代缓存不友好），
-    // 保持分祖先求解（DAG 路径下同——每祖先一个 B 任务）。
-    d.X.reserve(anc.size() * 2);
-    d.Y.reserve(anc.size() * 2);
-    for (int64_t a : anc)
-        solveXYAnc_(i, d, a, leaf);
-    if (stats)
-        recordNodeStat_(i);
-    {
-        const double dt = std::chrono::duration<double>(Clock::now() - t1).count();
-        std::lock_guard<std::mutex> lk(statsMutex_);
-        timing_["solve"] += dt;
-        timing_[std::string("solve") + who] += dt;
-    }
-}
-
-void GaussianElimination::computeNodeA_(int64_t i, ElimData& d) {
-    factorNode_(i, d);
-    solveXY_(i, d);
-}
-
-const ColComp&
-GaussianElimination::makeWX_(int64_t i, ElimData& d, int64_t a) const {
-    // T3 结合律：K_{a,i}·(K̂⁻¹M̂)·X_a = K_{a,i}·W̃·X_a（W̃ = K̂⁻¹M̂）。
-    // Mtemp W̃ 节点级惰性物化：首次进入时一次宽回代（wMut 互斥，
-    // per 祖先 C 任务可并发首次进入），之后本节点全部复用：
-    //   GE  C/E：WX_a = W̃·X_a（gemm，免逐次窄回代）
-    //   缩聚 f：WMz = W̃·Z_i（式 16/17a，释放由 cond.rel(i) 托管）
-    // X_a 已 ColComp 窄存（data = n_i×c_a）：WX_a = W̃·X_a.data 窄 gemm，
-    // 窄存 ColComp{cols=X_a.cols} 供 E 任务的交集列跳过消费。
-    auto it = d.WX.find(a);
-    if (it != d.WX.end() && it->second.has_value())
-        return *it->second;
-    {
-        std::lock_guard<std::mutex> lk(d.wMut);
-        if (!d.wTransformed) {
-            const bool leaf = isLeaf(i);
-            // M̂ 在 F(i)（=全部后代消去完成）后终态，此处拷贝安全。
-            const DenseMatrix Mh = leaf
-                                       ? DenseMatrix(origMDiag_.at(i))
-                                       : DenseMatrix(mDiag(i).data);
-            DenseMatrix Wt;
-            solveFactor(i, Mh, Wt);
-            d.W = std::move(Wt);
-            d.wTransformed = true;
-        }
-    }
-    ColComp wx;
-    wx.full = d.X.at(a).full;
-    wx.ident = false;
-    wx.cols = d.X.at(a).cols;
-    if (!wx.cols.empty()) {
-        DenseMatrix WXg;
-        ops().gemm(CblasNoTrans, CblasNoTrans, 1.0, d.W, d.X.at(a).data,
-                   0.0, WXg);
-        wx.data = std::move(WXg);
-    }
-    if (it != d.WX.end()) {
-        it->second = std::move(wx);
-        return *it->second;
-    }
-    return *d.WX.emplace(a, std::move(wx)).first->second;
-}
-
-void GaussianElimination::schurKDiagTask_(int64_t i, ElimData& d, int64_t a,
-                                          bool leaf) {
-    auto& prof = phaseProf();
-    const auto tp0 = std::chrono::steady_clock::now();
-    // 尾部大任务（观测 3.2s 级）在就绪队列空闸下临时放开 BLAS 多线程。
-    const double gf =
-        2.0 * size_[static_cast<size_t>(a)] * size_[static_cast<size_t>(i)] *
-        d.X.at(a).storedCols() / 1e9;
-    auto mb = blas::maybeBudget(gf);
-    std::lock_guard<std::mutex> lk(keyLock_(a));
-    ColComp& tgt = kDiagTarget_(a);
-    if (leaf)
-        ops().subMul(tgt.data, origK_(a, i), d.X.at(a));
-    else
-        ops().subMul(tgt, kCoup_(a, i), d.X.at(a));
-    profAdd(prof.schurKdiag,
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - tp0).count());
-}
-
-void GaussianElimination::schurKCoupTask_(int64_t i, ElimData& d, int64_t hi,
-                                          int64_t lo, bool leaf) {
-    auto& prof = phaseProf();
-    const auto tp0 = std::chrono::steady_clock::now();
-    const double gf =
-        2.0 * size_[static_cast<size_t>(hi)] * size_[static_cast<size_t>(i)] *
-        d.X.at(lo).storedCols() / 1e9;
-    auto mb = blas::maybeBudget(gf);
-    std::lock_guard<std::mutex> lk(keyLock_(key_(hi, lo)));
-    ColComp& tgt = kCoupTarget_(hi, lo);
-    if (leaf)
-        ops().subMul(tgt, origK_(hi, i), d.X.at(lo));
-    else
-        ops().subMul(tgt, kCoup_(hi, i), d.X.at(lo));
-    profAdd(prof.schurKcoup,
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - tp0).count());
-}
-
-void GaussianElimination::congDiagTask_(int64_t i, ElimData& d, int64_t a,
-                                        bool leaf) {
-    auto& prof = phaseProf();
-    const auto tp0 = std::chrono::steady_clock::now();
-    double kw = 0;
-    const auto itw = d.WX.find(a);
-    if (itw != d.WX.end() && itw->second)
-        kw = static_cast<double>(itw->second->storedCols());
-    const double gf =
-        2.0 * size_[static_cast<size_t>(a)] * size_[static_cast<size_t>(i)] *
-        (2.0 * d.Y.at(a).storedCols() + kw) / 1e9;
-    auto mb = blas::maybeBudget(gf);
-    const ColComp& wx = makeWX_(i, d, a);
-    profAdd(prof.congDiagWX,
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - tp0).count());
-    const auto tp1 = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lk(keyLock_(a));
-    ColComp& md = mDiagTarget_(a);
-    if (leaf) {
-        ops().subMul(md, origK_(a, i), d.Y.at(a));
-        ops().subTransMul(md, origK_(a, i), d.Y.at(a));
-        ops().addMul(md, origK_(a, i), wx);
-    } else {
-        const ColComp& B = kCoup_(a, i);
-        ops().subMul(md, B, d.Y.at(a));
-        ops().subTransMul(md, B, d.Y.at(a));
-        ops().addMul(md, B, wx);
-    }
-    profAdd(prof.congDiagT,
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - tp1).count());
-}
-
-void GaussianElimination::congCoupTask_(int64_t i, ElimData& d, int64_t hi,
-                                        int64_t lo, bool leaf) {
-    auto& prof = phaseProf();
-    const auto tp0 = std::chrono::steady_clock::now();
-    double kw = 0;
-    const auto itw = d.WX.find(lo);
-    if (itw != d.WX.end() && itw->second)
-        kw = static_cast<double>(itw->second->storedCols());
-    const double gf =
-        2.0 * size_[static_cast<size_t>(i)] *
-        (size_[static_cast<size_t>(hi)] * (d.Y.at(lo).storedCols() + kw) +
-         size_[static_cast<size_t>(lo)] * d.Y.at(hi).storedCols()) /
-        1e9;
-    auto mb = blas::maybeBudget(gf);
-    const ColComp& wx = makeWX_(i, d, lo);
-    std::lock_guard<std::mutex> lk(keyLock_(key_(hi, lo)));
-    ColComp& tgt = mCoupTarget_(hi, lo);
-    if (leaf) {
-        ops().subMul(tgt, origK_(hi, i), d.Y.at(lo));
-        ops().subTransMul(tgt, origK_(lo, i), d.Y.at(hi));
-        ops().addMul(tgt, origK_(hi, i), wx);
-    } else {
-        const ColComp& Bhi = kCoup_(hi, i);
-        ops().subMul(tgt, Bhi, d.Y.at(lo));
-        ops().subTransMul(tgt, kCoup_(lo, i), d.Y.at(hi));
-        ops().addMul(tgt, Bhi, wx);
-    }
-    profAdd(prof.congCoup,
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - tp0).count());
-}
-
-void GaussianElimination::applyNodeB_(int64_t i, ElimData& d) {
-    using Clock = std::chrono::steady_clock;
     const bool leaf = isLeaf(i);
     const char* who = leaf ? ".leaf" : ".sep";
-    const std::vector<int64_t> anc = tree_.ancestors(i);
-    if (anc.empty())
-        return;
-    const Clock::time_point t2 = Clock::now();
-    Clock::time_point t3;
-
-    // ---- 4. K 单边 Schur 更新（P6；列压缩：求和维只走乘子存储列，
-    //      右端行 gather 由乘子列映射驱动——算子内部完成）----
+    auto t2 = Clock::now();
     for (int64_t a : anc)
-        schurKDiagTask_(i, d, a, leaf);
+        stiffnessDiagUpdate(i, a);
     for (size_t p = 0; p < anc.size(); ++p)
         for (size_t q = p + 1; q < anc.size(); ++q)
-            schurKCoupTask_(i, d, anc[q], anc[p], leaf);
-    t3 = Clock::now();
+            stiffnessCoupUpdate(i, anc[q], anc[p]);
     {
-        const double dt = std::chrono::duration<double>(t3 - t2).count();
+        const double dt = std::chrono::duration<double>(Clock::now() - t2)
+                              .count();
         std::lock_guard<std::mutex> lk(statsMutex_);
         timing_["schurK"] += dt;
         timing_[std::string("schurK") + who] += dt;
     }
-
-    // ---- 5. M 双边同余更新（式 2 的 M⁽ⁱ⁾ 递归）----
-    // 对角：M̄_{a,a} −= K_{a,i}Y_a + (K_{a,i}Y_a)ᵀ − K_{a,i}·W·X_a
-    // 三项全部直写 md（beta=1 累加），无 t/t2 中间量、无转置拷贝。
+    t2 = Clock::now();
     for (int64_t a : anc)
-        congDiagTask_(i, d, a, leaf);
-    // 耦合：M̄_{hi,lo} −= K_{hi,i}Y_lo + (K_{lo,i}Y_hi)ᵀ − K_{hi,i}·W·X_lo
-    // 三项均经算子限制在接收块存储列上；W·X_lo 与 hi 无关，按 lo 提公因子
-    //（makeWX_ 缓存保证每个 lo 只算一次）。
+        massDiagUpdate(i, a);
     for (size_t p = 0; p < anc.size(); ++p)
         for (size_t q = p + 1; q < anc.size(); ++q)
-            congCoupTask_(i, d, anc[q], anc[p], leaf);
+            massCoupUpdate(i, anc[q], anc[p]);
     {
-        const double dt = std::chrono::duration<double>(Clock::now() - t3)
+        const double dt = std::chrono::duration<double>(Clock::now() - t2)
                               .count();
         std::lock_guard<std::mutex> lk(statsMutex_);
         timing_["congrM"] += dt;
         timing_[std::string("congrM") + who] += dt;
     }
-}
-
-void GaussianElimination::eliminateNode_(int64_t i) {
-    ElimData d;
-    computeNodeA_(i, d);
-    applyNodeB_(i, d);
 }
 
 void GaussianElimination::run(int numThreads) {
@@ -856,7 +855,7 @@ void GaussianElimination::run(int numThreads) {
     }
     // 层并行：level=0（叶）→ 根。层间 barrier 后本层节点读到的后代列块/
     // 对角块均已定稿；同层节点的写集合（祖先 diag/anc 对块）与读集合
-    // （自身列块 (a,i)）互不相交，写-写冲突由 applyNodeB_ 内条带锁处理。
+    // （自身列块 (a,i)）互不相交，写-写冲突由条带锁处理。
     for (int64_t l = 0; l <= maxLevel_; ++l)
         runLevel(l, numThreads);
 }
@@ -867,9 +866,7 @@ void GaussianElimination::runLevel(int64_t l, int numThreads) {
     parallelFor(
         0, static_cast<int64_t>(nodes.size()),
         [&](int64_t t) {
-            ElimData d;
-            computeNodeA_(nodes[static_cast<size_t>(t)], d);
-            applyNodeB_(nodes[static_cast<size_t>(t)], d);
+            eliminateNode_(nodes[static_cast<size_t>(t)]);
         },
         numThreads);
     const double dt = std::chrono::duration<double>(
@@ -886,11 +883,11 @@ void GaussianElimination::runDag(int numThreads) {
     using Clock = std::chrono::steady_clock;
     const auto tg0 = Clock::now();
     DagRunner dag(numThreads);
-    GeDagTasks info;
+    EliminationDagTasks info;
     buildDag(dag, info);
     for (const int64_t i : order_)
         if (tree_.node(i).children.empty())
-            dag.ready(*info.f[static_cast<size_t>(i)]);
+            dag.ready(*info.n1[static_cast<size_t>(i)]);
     dag.waitIdle();
 
     const double dt = std::chrono::duration<double>(Clock::now() - tg0).count();
@@ -901,318 +898,168 @@ void GaussianElimination::runDag(int numThreads) {
     }
 }
 
-void GaussianElimination::buildDag(DagRunner& dag, GeDagTasks& out) {
-    out.f.assign(static_cast<size_t>(N_), nullptr);
-    out.done.assign(static_cast<size_t>(N_), nullptr);
+void GaussianElimination::buildDag(DagRunner& dag, EliminationDagTasks& out) {
+    out.n1.assign(static_cast<size_t>(N_), nullptr);
+    out.n3.assign(static_cast<size_t>(N_), nullptr);
+    out.updatesDone.assign(static_cast<size_t>(N_), nullptr);
 
-    // ---- 节点任务句柄（后序建图：孩子先于父）----
     struct NodeTasks {
-        DagTask* F = nullptr;      // 分解 + M̂ 缓存
-        DagTask* done = nullptr;   // 节点完成哨兵（→ F(parent) 边）
-        std::vector<DagTask*> B, C, Dd, Ed;  // per 祖先
-        std::vector<DagTask*> Dc, Ec;        // per 祖先对（展平 p<q）
-        // 按消费者链精确释放（X/Y/WX 全宽稠密是内存大头：3·n_i·Σn_a·8B；
-        // 等 DONE 才放会在首波肥叶同时存活时 OOM——250k 实测 2s 内 13GB）。
-        std::vector<DagTask*> relX, relY, relWX;  // per 祖先
-        DagTask* relW = nullptr;
+        DagTask* n1 = nullptr;
+        DagTask* n3 = nullptr;
+        DagTask* updatesDone = nullptr;   // N4/N5 汇合哨兵
+        DagTask* freeCoup = nullptr;      // N2
+        DagTask* done = nullptr;          // 负载自适应探针
+        std::vector<DagTask*> n4d, n5d;   // per 祖先
+        std::vector<DagTask*> n4c, n5c;   // per 祖先对（展平 p<q）
     };
     std::vector<NodeTasks> nt(static_cast<size_t>(N_));
-    dagData_.assign(static_cast<size_t>(N_), nullptr);
     trace::mark("meta", "ge.begin", N_, maxLevel_);
 
-    // 优先级 = 后序 rank*8 + phase（F0 B1 C2 D3 E4 rel5 DONE6）。
-    // 必须是节点主序：FIFO 就绪队列会让全部叶子的 B 先于任何一个 C 执行，
-    // X/Y(叶×根) 全量同时存活（250k 实测 ~16GB OOM，trace 4292 事件无一 C）；
-    // 节点主序保证"先开链的节点先释放"，存活 X/Y 收缩为滑动窗口。
+    // 优先级 = 后序 rank*16 + phase（节点主序：FIFO 会让全部叶子的后续
+    // 任务先于任何一个收尾任务执行，块全量同时存活 OOM；节点主序保证
+    // "先开链的节点先释放"，存活块收缩为滑动窗口）。
     std::vector<int64_t> rank(static_cast<size_t>(N_));
     for (int64_t r = 0; r < static_cast<int64_t>(order_.size()); ++r)
         rank[static_cast<size_t>(order_[static_cast<size_t>(r)])] = r;
 
     for (const int64_t i : order_) {
-        const int64_t pr = rank[static_cast<size_t>(i)] * 8;
+        const int64_t pr = rank[static_cast<size_t>(i)] * 16;
         const std::vector<int64_t> anc = tree_.ancestors(i);
-        const bool leaf = isLeaf(i);
         const int64_t A = static_cast<int64_t>(anc.size());
         const int64_t lv = level_[static_cast<size_t>(i)];
         const int64_t ni = size_[static_cast<size_t>(i)];
-        auto d = std::make_shared<ElimData>();
-        dagData_[static_cast<size_t>(i)] = d;
-        // 预填全部键：任务阶段多线程只做值写入，unordered_map 无结构
-        // 变更（并发插入会损坏桶结构——回归测试 out_of_range 的根因）。
-        d->X.reserve(static_cast<size_t>(A) * 2);
-        d->Y.reserve(static_cast<size_t>(A) * 2);
-        d->WX.reserve(static_cast<size_t>(A) * 2);
-        for (int64_t a : anc) {
-            d->X.emplace(a, ColComp());
-            d->Y.emplace(a, ColComp());
-            d->WX.emplace(a, std::optional<ColComp>());
-        }
         auto& t = nt[static_cast<size_t>(i)];
 
-        t.F = &dag.emplace([this, i, d, ni, lv] {
-            trace::Scope s("ge", "F", i);
+        // ---- N1（phase 0）：约束模态回代。就绪 = 直接孩子 N4/N5 完成
+        //（跨层并行：子树先完成的父节点先跑；后代更新沿哨兵链传递）。----
+        t.n1 = &dag.emplace([this, i, ni, lv] {
+            trace::Scope s("ge", "N1", i);
             if (trace::enabled()) { s.e.aux = ni; s.e.aux2 = lv; }
-            if (std::getenv("AMLS_DUMP_K"))
-                std::fprintf(stderr, "[dumpge] F i=%lld runs\n",
-                             static_cast<long long>(i));
-            factorNode_(i, *d);
-            if (stats)
-                recordNodeStat_(i);
+            computeConstraintModes(i);
         });
-        t.F->prio = pr;   // phase 0
-        // 节点就绪 = 直接孩子 DONE（跨层并行：子树先完成的父节点先跑）。
+        t.n1->prio = pr;
         for (const int64_t c : tree_.node(i).children)
-            dag.depend(*t.F, *nt[static_cast<size_t>(c)].done);
+            dag.depend(*t.n1, *nt[static_cast<size_t>(c)].updatesDone);
 
-        t.B.resize(static_cast<size_t>(A));
-        t.C.resize(static_cast<size_t>(A));
-        t.Dd.resize(static_cast<size_t>(A));
-        t.Ed.resize(static_cast<size_t>(A));
+        // ---- N3（phase 1）：Mtemp 构造 ← N1 ----
+        t.n3 = &dag.emplace([this, i, lv] {
+            trace::Scope s("ge", "N3", i);
+            if (trace::enabled()) s.e.aux2 = lv;
+            buildTemporaryMass(i);
+        });
+        t.n3->prio = pr + 1;
+        dag.depend(*t.n3, *t.n1);
+
+        // ---- N4（phase 2）/ N5（phase 3）----
+        t.n4d.resize(static_cast<size_t>(A));
+        t.n5d.resize(static_cast<size_t>(A));
         for (int64_t u = 0; u < A; ++u) {
             const int64_t a = anc[static_cast<size_t>(u)];
-            auto& Bu = t.B[static_cast<size_t>(u)];
-            auto& Cu = t.C[static_cast<size_t>(u)];
-            auto& Du = t.Dd[static_cast<size_t>(u)];
-            auto& Eu = t.Ed[static_cast<size_t>(u)];
-            // B（式 7a/8a）：X_a / Y_a 回代。
-            Bu = &dag.emplace([this, i, a, leaf, d, lv] {
-                trace::Scope s("ge", "B", i);
+            auto& n4 = t.n4d[static_cast<size_t>(u)];
+            auto& n5 = t.n5d[static_cast<size_t>(u)];
+            n4 = &dag.emplace([this, i, a, lv] {
+                trace::Scope s("ge", "N4.diag", i);
                 if (trace::enabled()) { s.e.aux = a; s.e.aux2 = lv; }
-                solveXYAnc_(i, *d, a, leaf);
+                stiffnessDiagUpdate(i, a);
             });
-            Bu->prio = pr + 1;   // phase 1
-            dag.depend(*Bu, *t.F);
-            // C（式 8c/7c）：WX_a = K̂⁻¹(M̂·X_a)——算过即缓存，E 不重复算。
-            Cu = &dag.emplace([this, i, a, d, lv] {
-                trace::Scope s("ge", "C", i);
+            n4->prio = pr + 2;
+            dag.depend(*n4, *t.n1);
+            n5 = &dag.emplace([this, i, a, lv] {
+                trace::Scope s("ge", "N5.diag", i);
                 if (trace::enabled()) { s.e.aux = a; s.e.aux2 = lv; }
-                (void)makeWX_(i, *d, a);
+                massDiagUpdate(i, a);
             });
-            Cu->prio = pr + 2;   // phase 2
-            dag.depend(*Cu, *Bu);
-            // D（式 7d/8d）：K Schur 更新。
-            Du = &dag.emplace([this, i, a, leaf, d, lv] {
-                trace::Scope s("ge", "D.diag", i);
-                if (trace::enabled()) { s.e.aux = a; s.e.aux2 = lv; }
-                schurKDiagTask_(i, *d, a, leaf);
-            });
-            Du->prio = pr + 3;   // phase 3
-            dag.depend(*Du, *Bu);
-            Eu = &dag.emplace([this, i, a, leaf, d, lv] {
-                trace::Scope s("ge", "E.diag", i);
-                if (trace::enabled()) { s.e.aux = a; s.e.aux2 = lv; }
-                congDiagTask_(i, *d, a, leaf);
-            });
-            Eu->prio = pr + 4;   // phase 4
-            dag.depend(*Eu, *Bu);   // Y_a
-            dag.depend(*Eu, *Cu);   // WX_a
+            n5->prio = pr + 3;
+            dag.depend(*n5, *t.n1);
+            dag.depend(*n5, *t.n3);
         }
         const int64_t P = A * (A - 1) / 2;
-        t.Dc.resize(static_cast<size_t>(P));
-        t.Ec.resize(static_cast<size_t>(P));
-        t.relX.resize(static_cast<size_t>(A));
-        t.relY.resize(static_cast<size_t>(A));
-        t.relWX.resize(static_cast<size_t>(A));
+        t.n4c.resize(static_cast<size_t>(P));
+        t.n5c.resize(static_cast<size_t>(P));
         int64_t pi = 0;
         for (int64_t q = 1; q < A; ++q)
             for (int64_t p = 0; p < q; ++p, ++pi) {
                 const int64_t hi = anc[static_cast<size_t>(q)];
                 const int64_t lo = anc[static_cast<size_t>(p)];
-                t.Dc[static_cast<size_t>(pi)] =
-                    &dag.emplace([this, i, hi, lo, leaf, d, lv] {
-                        trace::Scope s("ge", "D.coup", i);
+                t.n4c[static_cast<size_t>(pi)] =
+                    &dag.emplace([this, i, hi, lo, lv] {
+                        trace::Scope s("ge", "N4.coup", i);
                         if (trace::enabled()) { s.e.aux = hi * N_ + lo; s.e.aux2 = lv; }
-                        schurKCoupTask_(i, *d, hi, lo, leaf);
+                        stiffnessCoupUpdate(i, hi, lo);
                     });
-                t.Dc[static_cast<size_t>(pi)]->prio = pr + 3;
-                dag.depend(*t.Dc[static_cast<size_t>(pi)], *t.B[static_cast<size_t>(p)]);
-                t.Ec[static_cast<size_t>(pi)] =
-                    &dag.emplace([this, i, hi, lo, leaf, d, lv] {
-                        trace::Scope s("ge", "E.coup", i);
+                t.n4c[static_cast<size_t>(pi)]->prio = pr + 2;
+                dag.depend(*t.n4c[static_cast<size_t>(pi)], *t.n1);
+                t.n5c[static_cast<size_t>(pi)] =
+                    &dag.emplace([this, i, hi, lo, lv] {
+                        trace::Scope s("ge", "N5.coup", i);
                         if (trace::enabled()) { s.e.aux = hi * N_ + lo; s.e.aux2 = lv; }
-                        congCoupTask_(i, *d, hi, lo, leaf);
+                        massCoupUpdate(i, hi, lo);
                     });
-                t.Ec[static_cast<size_t>(pi)]->prio = pr + 4;
-                dag.depend(*t.Ec[static_cast<size_t>(pi)], *t.B[static_cast<size_t>(p)]);  // Y_lo
-                dag.depend(*t.Ec[static_cast<size_t>(pi)], *t.B[static_cast<size_t>(q)]);  // Y_hi
-                dag.depend(*t.Ec[static_cast<size_t>(pi)], *t.C[static_cast<size_t>(p)]);  // WX_lo
+                t.n5c[static_cast<size_t>(pi)]->prio = pr + 3;
+                dag.depend(*t.n5c[static_cast<size_t>(pi)], *t.n1);
+                dag.depend(*t.n5c[static_cast<size_t>(pi)], *t.n3);
             }
 
-        // ---- 按消费者链精确释放（不阻塞 DONE，只缩短存活期）----
-        // X_a ← D.diag(u) + D.coup(p==u)；且 C_u 的 makeWX gather X_a。
-        // Y_a ← E.diag(u) + E.coup(p==u | q==u)。WX_a ← E.diag(u) + E.coup(p==u)。
-        // W   ← 全部 C。释放后无二次使用（缓存命中路径都已在其消费者之前）。
+        // ---- updatesDone（phase 4）：N4/N5 汇合哨兵；父节点 N1 的锚点。
+        // 根节点 A=0 时无 N4/N5 → 补 ← N1 防悬挂（冗余边无代价）。----
+        t.updatesDone = &dag.emplace([] {});
+        t.updatesDone->prio = pr + 4;
+        dag.depend(*t.updatesDone, *t.n1);
         for (int64_t u = 0; u < A; ++u) {
-            const int64_t a = anc[static_cast<size_t>(u)];
-            t.relX[static_cast<size_t>(u)] =
-                &dag.emplace([d, a] {
-                    std::lock_guard<std::mutex> lk(d->relMut);
-                    d->X.erase(a);
-                });
-            t.relX[static_cast<size_t>(u)]->prio = pr + 5;   // phase 5
-            t.relY[static_cast<size_t>(u)] =
-                &dag.emplace([d, a] {
-                    std::lock_guard<std::mutex> lk(d->relMut);
-                    d->Y.erase(a);
-                });
-            t.relY[static_cast<size_t>(u)]->prio = pr + 5;
-            t.relWX[static_cast<size_t>(u)] =
-                &dag.emplace([d, a] {
-                    std::lock_guard<std::mutex> lk(d->relMut);
-                    d->WX.erase(a);
-                });
-            t.relWX[static_cast<size_t>(u)]->prio = pr + 5;
+            dag.depend(*t.updatesDone, *t.n4d[static_cast<size_t>(u)]);
+            dag.depend(*t.updatesDone, *t.n5d[static_cast<size_t>(u)]);
         }
-        t.relW = &dag.emplace([this, d] {
-            if (!wReleaseDeferred_)
-                d->W.resize(0, 0);
-        });
-        t.relW->prio = pr + 5;
-        // 根节点 A=0 时下方循环全空 → relW 无依赖、又不是 ready 种子
-        //（solver 只 ready 叶子 F）→ 悬挂；而 DONE 无条件等 relW，连带
-        // done(根) 悬挂 → spec(根) 永不执行（res.k[根]=0，path:800 实测
-        // p 少 1）。补 relW ← F：W 是 F 分解的产物缓存，F 后释放即安全。
-        dag.depend(*t.relW, *t.F);
-        for (int64_t u = 0; u < A; ++u) {
-            auto& rX = *t.relX[static_cast<size_t>(u)];
-            auto& rY = *t.relY[static_cast<size_t>(u)];
-            auto& rW = *t.relWX[static_cast<size_t>(u)];
-            dag.depend(rX, *t.C[static_cast<size_t>(u)]);
-            dag.depend(rX, *t.Dd[static_cast<size_t>(u)]);
-            dag.depend(rY, *t.Ed[static_cast<size_t>(u)]);
-            dag.depend(rW, *t.Ed[static_cast<size_t>(u)]);
-            dag.depend(*t.relW, *t.C[static_cast<size_t>(u)]);
-        }
-        for (int64_t pi2 = 0; pi2 < P; ++pi2) {
-            // p 索引在 pair 展平中的位置：pi2 = q(q-1)/2 + p
-            int64_t q2 = 1, base = 0;
-            while (base + q2 <= pi2) { base += q2; ++q2; }
-            const int64_t p2 = pi2 - base;
-            dag.depend(*t.relX[static_cast<size_t>(p2)], *t.Dc[static_cast<size_t>(pi2)]);
-            dag.depend(*t.relY[static_cast<size_t>(p2)], *t.Ec[static_cast<size_t>(pi2)]);
-            dag.depend(*t.relY[static_cast<size_t>(q2)], *t.Ec[static_cast<size_t>(pi2)]);
-            dag.depend(*t.relWX[static_cast<size_t>(p2)], *t.Ec[static_cast<size_t>(pi2)]);
+        for (int64_t p2 = 0; p2 < P; ++p2) {
+            dag.depend(*t.updatesDone, *t.n4c[static_cast<size_t>(p2)]);
+            dag.depend(*t.updatesDone, *t.n5c[static_cast<size_t>(p2)]);
         }
 
-        // DONE：全部 D/E 完成后节点 i 消去收尾；顺带释放 X/Y/WX 工作内存
-        //（与旧路径 eliminateNode_ 返回即析构 ElimData 等价）。
-        // AMLS_FREE_FACTORS：打桩探针专用——节点消去完成后立即释放其 LDL
-        // 因子（数值上破坏缩聚投影，仅用于验证"452 个叶因子常驻 = 250k OOM"
-        // 假设；正式解法是缩聚统一 DAG 内释放）。
-        static const bool probeFreeFactors = std::getenv("AMLS_FREE_FACTORS") != nullptr;
-        t.done = &dag.emplace([this, d, i, lv, probeFreeFactors, &dag] {
-            trace::Scope s("ge", "DONE", i);
-            if (trace::enabled()) { s.e.aux2 = lv; }
-            if (probeFreeFactors) {
-                std::lock_guard<std::mutex> lk(structMutex_);
-                sparseFactors_[static_cast<size_t>(i)].reset();
-                denseFactors_[static_cast<size_t>(i)].reset();
-            }
-            {
-                std::lock_guard<std::mutex> lk(d->relMut);
-                d->X.clear();
-                d->Y.clear();
-                d->WX.clear();
-            }
-            // W（Mtemp = K̂⁻¹M̂）在统一 DAG 路径下移交给缩聚复用
-            // （f: WMz = W·Z_i），cond.rel(i) 才释放；旧路径此处释放。
-            if (!wReleaseDeferred_)
-                d->W.resize(0, 0);
-            // 负载自适应：每完成一个节点判定一次饥饿（就绪空 + 活跃少），
-            // 连续 3 个节点成立则升任务内并行度档（只升不降）。
+        // ---- N2（phase 5）：耦合列释放 ← N1/N3/N4/N5 全部（经哨兵）----
+        if (A > 0) {
+            t.freeCoup = &dag.emplace([this, i] {
+                trace::Scope s("ge", "N2.free", i);
+                releaseCouplingColumn(i);
+            });
+            t.freeCoup->prio = pr + 5;
+            dag.depend(*t.freeCoup, *t.updatesDone);
+            dag.depend(*t.freeCoup, *t.n3);
+        }
+
+        // ---- done（phase 6）：负载自适应探针（饥饿升档）----
+        t.done = &dag.emplace([&dag, lv] {
+            trace::Scope s("ge", "DONE", -1);
+            if (trace::enabled()) s.e.aux2 = lv;
             const int before = dag.taskParallelism();
             dag.noteNodeDone();
             const int after = dag.taskParallelism();
             if (after > before)
                 trace::mark("dag", "loadlevel", after);
         });
-        t.done->prio = pr + 6;   // phase 6
-        // 根节点 A=0 时上面循环全空 → done 无任何依赖，而 DagRunner
-        // 只从显式 ready 的种子出发（solver ready 叶子 F），无依赖的
-        // done 永远不会触发——统一 DAG 里 spec(root) 等不到 done(root)，
-        // res.k[root] 停留初始 0（path:800 实测 p 少 1、根模态丢失）。
-        // 补 done ← F：对 A>0 是冗余边（D/E 传递已等 F），对根是救活链。
-        dag.depend(*t.done, *t.F);
-        for (int64_t u = 0; u < A; ++u) {
-            dag.depend(*t.done, *t.Dd[static_cast<size_t>(u)]);
-            dag.depend(*t.done, *t.Ed[static_cast<size_t>(u)]);
-        }
-        for (int64_t pi2 = 0; pi2 < P; ++pi2) {
-            dag.depend(*t.done, *t.Dc[static_cast<size_t>(pi2)]);
-            dag.depend(*t.done, *t.Ec[static_cast<size_t>(pi2)]);
-        }
-        // DONE 与 relX/relY/relWX/relW 之间无数据依赖边但共享 d->X/Y/WX/W：
-        // 二者常在同一完成事件后同时就绪，被不同 worker 并行弹出 →
-        // erase/clear/resize 并发改同一 unordered_map → 堆破坏（随机 AV，
-        // 46k/12 线程 ~40% 复现）。显式补序：释放任务先于 DONE。
-        for (int64_t u = 0; u < A; ++u) {
-            dag.depend(*t.done, *t.relX[static_cast<size_t>(u)]);
-            dag.depend(*t.done, *t.relY[static_cast<size_t>(u)]);
-            dag.depend(*t.done, *t.relWX[static_cast<size_t>(u)]);
-        }
-        dag.depend(*t.done, *t.relW);
-    }
+        t.done->prio = pr + 6;
+        dag.depend(*t.done, *t.updatesDone);
 
-    // ---- 输出任务句柄（ready/waitIdle 由调用方负责）----
-    for (const int64_t i : order_) {
-        out.f[static_cast<size_t>(i)] = nt[static_cast<size_t>(i)].F;
-        out.done[static_cast<size_t>(i)] = nt[static_cast<size_t>(i)].done;
+        out.n1[static_cast<size_t>(i)] = t.n1;
+        out.n3[static_cast<size_t>(i)] = t.n3;
+        out.updatesDone[static_cast<size_t>(i)] = t.updatesDone;
     }
 }
 
-void GaussianElimination::releaseNode(int64_t i) {
+void GaussianElimination::releaseNodeData(int64_t i,
+                                          bool keepConstraintModes) {
     std::lock_guard<std::mutex> lk(structMutex_);
     kDiag_.erase(i);
     mDiag_.erase(i);
-    for (int64_t a : tree_.ancestors(i)) {
+    for (const int64_t a : tree_.ancestors(i)) {
         const int64_t k = key_(a, i);
         kCoupD_.erase(k);
         mCoupD_.erase(k);
-    }
-}
-
-const GaussianElimination::DenseMatrix* GaussianElimination::nodeW(
-    int64_t i) const {
-    if (static_cast<size_t>(i) >= dagData_.size())
-        return nullptr;
-    const auto& d = dagData_[static_cast<size_t>(i)];
-    if (!d || d->W.size() == 0)
-        return nullptr;
-    return &d->W;
-}
-
-void GaussianElimination::releaseNodeW(int64_t i) const {
-    if (static_cast<size_t>(i) >= dagData_.size())
-        return;
-    const auto& d = dagData_[static_cast<size_t>(i)];
-    if (d)
-        d->W.resize(0, 0);
-}
-
-void GaussianElimination::shrinkNodeData(int64_t i, bool releaseFactor) const {
-    // 与 releaseNode 不同：不 erase 表项（桶链不动，可与运行期无锁 find
-    // 并发），只把已存在表项的稠密数据清零释放。调用方保证此刻无人再
-    // 读节点 i 的块（DAG 依赖序）；其它线程的 find 可能查到这些空壳，
-    // 但按依赖设计不会使用。
-    static auto shrink = [](ColComp& blk) {
-        blk.data.resize(0, 0);
-        blk.cols.clear();
-        blk.ident = false;
-    };
-    if (auto it = kDiag_.find(i); it != kDiag_.end())
-        shrink(it->second);
-    if (auto it = mDiag_.find(i); it != mDiag_.end())
-        shrink(it->second);
-    for (int64_t a : tree_.ancestors(i)) {
-        const int64_t k = key_(a, i);
-        if (auto it = kCoupD_.find(k); it != kCoupD_.end())
-            shrink(it->second);
-        if (auto it = mCoupD_.find(k); it != mCoupD_.end())
-            shrink(it->second);
-    }
-    if (releaseFactor) {
-        sparseFactors_[static_cast<size_t>(i)].reset();
-        denseFactors_[static_cast<size_t>(i)].reset();
+        if (auto it = temporaryMass_.find(modeKey_(i, a));
+            it != temporaryMass_.end())
+            it->second.shrink();
+        if (!keepConstraintModes)
+            if (auto it = constraintModes_.find(modeKey_(i, a));
+                it != constraintModes_.end())
+                it->second.shrink();
     }
 }
 
@@ -1223,8 +1070,7 @@ void GaussianElimination::resetBlocks() {
     decltype(kCoupD_)().swap(kCoupD_);
     decltype(mCoupD_)().swap(mCoupD_);
     // swap 后桶计数清零——重跑趟需恢复 reserve（运行期引用稳定性，
-    // 见构造器注释；容量上界与构造时相同，按符号结构重算代价高，
-    // 直接沿用节点/祖先结构的上界）。
+    // 见构造器注释）。
     int64_t coupKeys = 16;
     for (const int64_t i : order_) {
         const int64_t a = static_cast<int64_t>(tree_.ancestors(i).size());
@@ -1234,6 +1080,11 @@ void GaussianElimination::resetBlocks() {
     mCoupD_.reserve(static_cast<size_t>(coupKeys));
     kDiag_.reserve(static_cast<size_t>(N_) + 1);
     mDiag_.reserve(static_cast<size_t>(N_) + 1);
+    // u / Mtemp：键保留（预建语义），值缩容
+    for (auto& [_, v] : constraintModes_)
+        v.shrink();
+    for (auto& [_, v] : temporaryMass_)
+        v.shrink();
 }
 
 double GaussianElimination::denseBytes() const {
@@ -1249,6 +1100,8 @@ double GaussianElimination::denseBytes() const {
     sum(mDiag_);
     sum(kCoupD_);
     sum(mCoupD_);
+    sum(constraintModes_);
+    sum(temporaryMass_);
     return b;
 }
 

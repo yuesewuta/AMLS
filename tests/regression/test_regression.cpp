@@ -20,9 +20,9 @@ static void runCase(const PencilPair& pencil, DefaultTraits::Vector const& refSp
     opt.verbosity = 0;
     AmlsSolver solver;
     auto sol = solver.solve({pencil.K, pencil.M}, opt);
-    REQUIRE(sol.theta.size() == nev);
+    REQUIRE(sol.eigenvalues.size() == nev);
     DefaultTraits::Vector ref = refSpectrum.head(nev);
-    const double err = ErrorMetrics::maxEigenvalueRelErr(sol.theta, ref);
+    const double err = ErrorMetrics::maxEigenvalueRelErr(sol.eigenvalues, ref);
     REQUIRE(err <= tol);
 }
 
@@ -47,7 +47,8 @@ TEST_CASE("回归:grid 64×64 nev=50 η=2 nLevels=4", "[regression]") {
     auto pair = gridGraph2d(64, 64);
     auto sol = solver.solve({pair.K, pair.M}, opt);
     auto ref = gridGraph2dSpectrum(64, 64);
-    const double err = ErrorMetrics::maxEigenvalueRelErr(sol.theta, ref.head(50));
+    const double err =
+        ErrorMetrics::maxEigenvalueRelErr(sol.eigenvalues, ref.head(50));
     REQUIRE(err <= 0.04);
 }
 
@@ -66,8 +67,10 @@ TEST_CASE("回归:网格截断收敛性（η 越大误差越小）", "[regressio
     o1.verbosity = o2.verbosity = 0;
     auto a = s1.solve({pair.K, pair.M}, o1);
     auto b = s2.solve({pair.K, pair.M}, o2);
-    const double e1 = ErrorMetrics::maxEigenvalueRelErr(a.theta, ref.head(40));
-    const double e2 = ErrorMetrics::maxEigenvalueRelErr(b.theta, ref.head(40));
+    const double e1 =
+        ErrorMetrics::maxEigenvalueRelErr(a.eigenvalues, ref.head(40));
+    const double e2 =
+        ErrorMetrics::maxEigenvalueRelErr(b.eigenvalues, ref.head(40));
     REQUIRE(e1 <= 0.04);
     REQUIRE(e2 <= 0.04);
     REQUIRE(e2 <= e1 + 1e-12);   // 更宽阈值不差于更紧阈值

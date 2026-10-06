@@ -138,38 +138,38 @@ int main(int argc, char** argv) {
     if (!a.outFile.empty()) {
         std::ofstream out(a.outFile);
         out.precision(17);
-        for (int64_t j = 0; j < sol.theta.size(); ++j)
-            out << j + 1 << " " << sol.theta[j] << "\n";
+        for (int64_t j = 0; j < sol.eigenvalues.size(); ++j)
+            out << j + 1 << " " << sol.eigenvalues[j] << "\n";
     }
 
     std::cout.precision(10);
     std::cout << "# AMLS 求解完成 n=" << pencil.K.rows()
-              << " nev=" << a.opt.nev << " p=" << sol.p
+              << " nev=" << a.opt.nev << " p=" << sol.reducedSize
               << " 树节点=" << solver.lastTreeNodes() << "\n";
     std::cout << "# 计时(s): ";
     for (const auto& [k, v] : sol.timing)
         std::cout << k << "=" << v << " ";
     std::cout << "\n";
-    for (int64_t j = 0; j < sol.theta.size() && j < 10; ++j) {
-        std::cout << j + 1 << "\t" << sol.theta[j];
+    for (int64_t j = 0; j < sol.eigenvalues.size() && j < 10; ++j) {
+        std::cout << j + 1 << "\t" << sol.eigenvalues[j];
         if (lambdaRef.size() > j) {
             const double err =
-                std::abs(sol.theta[j] - lambdaRef[j]) /
+                std::abs(sol.eigenvalues[j] - lambdaRef[j]) /
                 (std::abs(lambdaRef[j]) > 0 ? std::abs(lambdaRef[j]) : 1.0);
             std::cout << "\tref=" << lambdaRef[j] << "\trelerr=" << err;
         }
         std::cout << "\n";
     }
-    if (sol.theta.size() > 10)
-        std::cout << "...（共 " << sol.theta.size() << " 阶）\n";
+    if (sol.eigenvalues.size() > 10)
+        std::cout << "...（共 " << sol.eigenvalues.size() << " 阶）\n";
 
     // 残差自洽性（第 1 与最后 1 阶）
-    if (sol.Z.cols() > 0) {
+    if (sol.eigenvectors.cols() > 0) {
         const double r1 = amls::ErrorMetrics::residual(
-            pencil.K, pencil.M, sol.theta[0], sol.Z.col(0));
+            pencil.K, pencil.M, sol.eigenvalues[0], sol.eigenvectors.col(0));
         const double rn = amls::ErrorMetrics::residual(
-            pencil.K, pencil.M, sol.theta[sol.theta.size() - 1],
-            sol.Z.col(sol.Z.cols() - 1));
+            pencil.K, pencil.M, sol.eigenvalues[sol.eigenvalues.size() - 1],
+            sol.eigenvectors.col(sol.eigenvectors.cols() - 1));
         std::cout << "# 残差: 第1阶=" << r1 << " 末阶=" << rn << "\n";
     }
 #ifdef _WIN32

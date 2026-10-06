@@ -60,9 +60,9 @@ void runCase(const std::string& name, amls::PencilPair pencil,
     row.nLevels = nLevels;
     try {
         auto sol = solver.solve(km, opt);
-        row.p = sol.p;
+        row.p = sol.reducedSize;
         // 比较时把移位减掉
-        amls::DefaultTraits::Vector theta = sol.theta;
+        amls::DefaultTraits::Vector theta = sol.eigenvalues;
         if (useShift)
             theta.array() -= opt.shift;
         const auto errs = amls::ErrorMetrics::eigenvalueRelErr(theta, lambdaRef);

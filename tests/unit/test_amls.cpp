@@ -1,4 +1,5 @@
-// AMLS 核心（截断策略 + 缩聚结构性质 + 全模态精确性）单元测试
+// AMLS 核心（截断策略 + 缩聚结构性质 + 全模态精确性 + 多跳 μ̃ 传播 +
+// 统一 DAG 端到端）单元测试
 #include <cmath>
 #include <set>
 
@@ -36,6 +37,29 @@ static Pencil<DefaultTraits> reorder(const PencilPair& p,
         if (src == &p.K) out.K = B; else out.M = B;
     }
     return out;
+}
+
+/// 装配降阶 pencil（M̃：对角 I + 树块；K̃：保留特征值对角）并稠密求解。
+static Vec solveReducedSpectrum(const SubspaceCondensation::Result& r,
+                                const SeparatorTree& tree) {
+    DM reducedMass = DM::Identity(r.reducedSize, r.reducedSize);
+    for (const auto& b : r.reducedMassBlocks) {
+        const int64_t r0 = r.reducedOffset[b.rowNode],
+                      c0 = r.reducedOffset[b.colNode];
+        reducedMass.block(r0, c0, b.block.rows(), b.block.cols()) = b.block;
+        reducedMass.block(c0, r0, b.block.cols(), b.block.rows()) =
+            b.block.transpose();
+    }
+    DM reducedK = DM::Zero(r.reducedSize, r.reducedSize);
+    for (int64_t i = 0; i < tree.nNodes(); ++i)
+        for (int64_t j = 0; j < r.keptModes[i]; ++j)
+            reducedK(r.reducedOffset[i] + j, r.reducedOffset[i] + j) =
+                r.eigenvalues[i][j];
+    LapackDenseEigensolver<DefaultTraits> lap;
+    DM Kc = reducedK, Mc = reducedMass, projectedVectors;
+    Vec projectedEigenvalues;
+    lap.solveAll(Kc, Mc, projectedEigenvalues, projectedVectors);
+    return projectedEigenvalues;
 }
 
 TEST_CASE("截断策略:固定数目与前 k 阶提示", "[truncation]") {
@@ -78,32 +102,35 @@ TEST_CASE("缩聚结构性质 P3/P4/P8", "[condensation]") {
     FixedCountTruncation<DefaultTraits> tr(0);   // 全保留
     auto r = cond.run(tr, 1);
 
-    // P3: K̃ 只存对角（mu）,长度=k_i,升序,等于局部特征值
+    // P3: K̃ 只存对角（eigenvalues）,长度=k_i,升序,等于局部特征值
     const auto order = pres.tree.postOrder();
     for (int64_t id : order) {
-        const int64_t k = r.k[id];
-        REQUIRE(r.mu[id].size() == k);
+        const int64_t k = r.keptModes[id];
+        REQUIRE(r.eigenvalues[id].size() == k);
         for (int64_t j = 1; j < k; ++j)
-            REQUIRE(r.mu[id][j] >= r.mu[id][j - 1]);
-        REQUIRE(r.Z[id].rows() ==
+            REQUIRE(r.eigenvalues[id][j] >= r.eigenvalues[id][j - 1]);
+        REQUIRE(r.eigenvectors[id].rows() ==
                 static_cast<int64_t>(pres.tree.node(id).indices.size()));
-        REQUIRE(r.Z[id].cols() == k);
+        REQUIRE(r.eigenvectors[id].cols() == k);
     }
     // P4: M̃ 非对角块的行节点是列节点的祖先
-    for (const auto& b : r.mprojBlocks) {
+    for (const auto& b : r.reducedMassBlocks) {
         auto anc = pres.tree.ancestors(b.colNode);
         REQUIRE(std::find(anc.begin(), anc.end(), b.rowNode) != anc.end());
     }
     // P8: 全保留 ⇒ M̃ 对角块 = I（装配后检查）
-    DM Mp = DM::Identity(r.p, r.p);
-    for (const auto& b : r.mprojBlocks) {
-        const int64_t r0 = r.projOffset[b.rowNode], c0 = r.projOffset[b.colNode];
-        Mp.block(r0, c0, b.block.rows(), b.block.cols()) = b.block;
-        Mp.block(c0, r0, b.block.cols(), b.block.rows()) = b.block.transpose();
+    DM reducedMass = DM::Identity(r.reducedSize, r.reducedSize);
+    for (const auto& b : r.reducedMassBlocks) {
+        const int64_t r0 = r.reducedOffset[b.rowNode],
+                      c0 = r.reducedOffset[b.colNode];
+        reducedMass.block(r0, c0, b.block.rows(), b.block.cols()) = b.block;
+        reducedMass.block(c0, r0, b.block.cols(), b.block.rows()) =
+            b.block.transpose();
     }
     for (int64_t id : order) {
-        const int64_t o = r.projOffset[id], k = r.k[id];
-        REQUIRE((Mp.block(o, o, k, k) - DM::Identity(k, k)).norm() < 1e-10);
+        const int64_t o = r.reducedOffset[id], k = r.keptModes[id];
+        REQUIRE((reducedMass.block(o, o, k, k) - DM::Identity(k, k)).norm() <
+                1e-10);
     }
 }
 
@@ -120,32 +147,86 @@ TEST_CASE("缩聚全模态:投影谱 == 闭式谱", "[condensation]") {
     SubspaceCondensation cond(ge, eig);
     FixedCountTruncation<DefaultTraits> tr(0);
     auto r = cond.run(tr, 1);
-    REQUIRE(r.p == pair.K.rows());        // 全保留 ⇒ p = n
+    REQUIRE(r.reducedSize == pair.K.rows());   // 全保留 ⇒ p = n
 
-    DM Mp = DM::Identity(r.p, r.p);
-    for (const auto& b : r.mprojBlocks) {
-        const int64_t r0 = r.projOffset[b.rowNode], c0 = r.projOffset[b.colNode];
-        Mp.block(r0, c0, b.block.rows(), b.block.cols()) = b.block;
-        Mp.block(c0, r0, b.block.cols(), b.block.rows()) = b.block.transpose();
-    }
-    DM Kp = DM::Zero(r.p, r.p);
-    for (int64_t i = 0; i < pres.tree.nNodes(); ++i)
-        for (int64_t j = 0; j < r.k[i]; ++j)
-            Kp(r.projOffset[i] + j, r.projOffset[i] + j) = r.mu[i][j];
-
-    LapackDenseEigensolver<DefaultTraits> lap;
-    DM Kc = Kp, Mc = Mp, V;
-    Vec w;
-    lap.solveAll(Kc, Mc, w, V);
+    Vec projectedEigenvalues = solveReducedSpectrum(r, pres.tree);
     auto ref = gridGraph2dSpectrum(10, 10);
     for (int64_t j = 0; j < 10; ++j)
-        REQUIRE(std::abs(w[j] - ref[j]) <= 1e-10 * std::max(1.0, std::abs(ref[j])));
+        REQUIRE(std::abs(projectedEigenvalues[j] - ref[j]) <=
+                1e-10 * std::max(1.0, std::abs(ref[j])));
 
-    // 回代残差（前 3 阶）
-    DM Q = V.leftCols(3);
-    DM z = cond.backtransform(r, Q);
+    // 回代残差（前 3 阶）：投影坐标 → 重排坐标（纯 GEMM 回代）
+    DM reducedMass = DM::Identity(r.reducedSize, r.reducedSize);
+    for (const auto& b : r.reducedMassBlocks) {
+        const int64_t r0 = r.reducedOffset[b.rowNode],
+                      c0 = r.reducedOffset[b.colNode];
+        reducedMass.block(r0, c0, b.block.rows(), b.block.cols()) = b.block;
+        reducedMass.block(c0, r0, b.block.cols(), b.block.rows()) =
+            b.block.transpose();
+    }
+    DM reducedK = DM::Zero(r.reducedSize, r.reducedSize);
+    for (int64_t i = 0; i < pres.tree.nNodes(); ++i)
+        for (int64_t j = 0; j < r.keptModes[i]; ++j)
+            reducedK(r.reducedOffset[i] + j, r.reducedOffset[i] + j) =
+                r.eigenvalues[i][j];
+    LapackDenseEigensolver<DefaultTraits> lap;
+    DM Kc = reducedK, Mc = reducedMass, projectedVectors;
+    Vec wAll;
+    lap.solveAll(Kc, Mc, wAll, projectedVectors);
+    DM recovered = cond.backtransform(r, projectedVectors.leftCols(3));
     for (int64_t j = 0; j < 3; ++j) {
-        DM rz = DM(reord.K) * z.col(j) - w[j] * (DM(reord.M) * z.col(j));
-        REQUIRE(rz.norm() < 1e-10 * (DM(reord.K) * z.col(j)).norm());
+        DM rz = DM(reord.K) * recovered.col(j) -
+                wAll[j] * (DM(reord.M) * recovered.col(j));
+        REQUIRE(rz.norm() < 1e-10 * (DM(reord.K) * recovered.col(j)).norm());
+    }
+}
+
+TEST_CASE("缩聚全模态:三层树多跳 μ̃ 传播", "[condensation]") {
+    // 3 层树 ⇒ 存在 c→i→a 两跳以上的传播链（μ̃(c,a) 需经中间节点 fold
+    // 逐段累加定稿）；全保留下投影谱仍须精确再现闭式谱。
+    auto pair = gridGraph2d(12, 12);
+    MetisPartitioner<DefaultTraits> part;
+    auto pres = part.recursiveBisection(pair.K + pair.M, 3, 20);
+    REQUIRE(pres.tree.nNodes() >= 8);   // 确实为 ≥3 层
+    auto reord = reorder(pair, pres.perm);
+    GaussianElimination ge(reord, pres.tree);
+    ge.run();
+    LapackDenseEigensolver<DefaultTraits> dense;
+    EigenpairSolver eig(dense);
+    SubspaceCondensation cond(ge, eig);
+    FixedCountTruncation<DefaultTraits> tr(0);
+    auto r = cond.run(tr, 1);
+    REQUIRE(r.reducedSize == pair.K.rows());
+
+    Vec projectedEigenvalues = solveReducedSpectrum(r, pres.tree);
+    auto ref = gridGraph2dSpectrum(12, 12);
+    for (int64_t j = 0; j < 12; ++j)
+        REQUIRE(std::abs(projectedEigenvalues[j] - ref[j]) <=
+                1e-10 * std::max(1.0, std::abs(ref[j])));
+}
+
+TEST_CASE("求解器统一DAG:全保留 ⇒ 精确谱与回代残差", "[solver]") {
+    // numThreads=4 走统一 DAG 路径（GE N1–N5 + 缩聚 N7–N10 同一 runner）；
+    // fixedKeep 超过任意节点规模 ⇒ 全保留 ⇒ 谱精确、回代残差机器精度。
+    auto pair = gridGraph2d(10, 10);
+    AmlsOptions opt;
+    opt.nLevels = 3;
+    opt.leafSize = 20;
+    opt.fixedKeep = 100;
+    opt.nev = 10;
+    opt.numThreads = 4;
+    opt.verbosity = 0;
+    opt.recoverVectors = true;
+    AmlsSolver solver;
+    auto sol = solver.solve({pair.K, pair.M}, opt);
+    auto ref = gridGraph2dSpectrum(10, 10);
+    for (int64_t j = 0; j < 10; ++j)
+        REQUIRE(std::abs(sol.eigenvalues[j] - ref[j]) <=
+                1e-8 * std::max(1.0, std::abs(ref[j])));
+    for (int64_t j = 0; j < 3; ++j) {
+        DM rz = DM(pair.K) * sol.eigenvectors.col(j) -
+                sol.eigenvalues[j] * (DM(pair.M) * sol.eigenvectors.col(j));
+        REQUIRE(rz.norm() <
+                1e-8 * (DM(pair.K) * sol.eigenvectors.col(j)).norm());
     }
 }
