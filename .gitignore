@@ -22,3 +22,27 @@ benchmark/matrices/
 benchmark/bin/
 benchmark/reference/
 benchmark/results/
+
+# Abaqus REA 逆向用安装/二进制目录（版权，不入库）
+rea/
+
+# PKU 版 AMLS 参考实现（仅本地参考，不纳入管理）
+third_party/amlsPKU/
+
+# Abaqus 对比基准数据（本地生成）
+bench_abaqus/
+
+# ZCode 会话数据
+.zcode/
+
+# 论文全文 markdown 转换稿（版权原因不入库）
+papers/*.md
+
+# 大型可再生成可视化产物（由 tools/plot_stf_tree_* 重新生成）
+docs/abaqus_ams/cant_31_tree.html
+docs/abaqus_ams/cant_31_消去树图.png
+
+# trace / 临时调试产物
+trace_*.json
+__pycache__/
+analysis_zero_cols.py
