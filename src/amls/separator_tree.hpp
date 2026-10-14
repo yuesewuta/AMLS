@@ -12,7 +12,7 @@ struct TreeNode {
     int64_t id = -1;
     NodeRole role = NodeRole::Leaf;
     std::vector<int64_t> indices;   // 本节点持有的原始行列索引
-    std::vector<int64_t> children;  // 分割节点恰有 2 子；叶节点为空
+    std::vector<int64_t> children;  // 分割节点至少 2 子；叶节点为空
     int64_t parent = -1;            // 根节点为 -1
 };
 
@@ -22,6 +22,8 @@ public:
 
     int64_t addNode(NodeRole role, std::vector<int64_t> indices);
     void setChildren(int64_t id, int64_t left, int64_t right);
+    /// 多叉版本（NodeND 组装树：分割节点可挂 ≥2 个子树）。
+    void setChildren(int64_t id, std::vector<int64_t> children);
     void setParent(int64_t id, int64_t parent);
 
     int64_t nNodes() const { return static_cast<int64_t>(nodes_.size()); }

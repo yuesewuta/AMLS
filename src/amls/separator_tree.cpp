@@ -19,6 +19,10 @@ void SeparatorTree::setChildren(int64_t id, int64_t left, int64_t right) {
     nodes_.at(id).children = {left, right};
 }
 
+void SeparatorTree::setChildren(int64_t id, std::vector<int64_t> children) {
+    nodes_.at(id).children = std::move(children);
+}
+
 void SeparatorTree::setParent(int64_t id, int64_t parent) {
     nodes_.at(id).parent = parent;
 }
@@ -81,16 +85,34 @@ bool SeparatorTree::validate(int64_t nTotal) const {
             ++nRoots;
     if (nRoots != 1)
         return false;
-    // 父子对称
+    // 每个非根节点恰有一条入边，并且所有节点从根可达。
+    std::vector<int64_t> incoming(nodes_.size(), 0);
     for (const auto& nd : nodes_) {
-        if (nd.role == NodeRole::Leaf && !nd.children.empty())
-            return false;
-        if (nd.role != NodeRole::Leaf && nd.children.size() != 2)
-            return false;
-        for (int64_t c : nd.children)
-            if (nodes_.at(c).parent != nd.id)
+        if (nd.role == NodeRole::Leaf && !nd.children.empty()) return false;
+        // 支持单子链：非叶节点可恰有 1 子（消去块树允许单子链）。
+        // 若角色为 Leaf 则必须无子；Separator/Root 可有 >=1 子。
+        for (int64_t c : nd.children) {
+            if (c < 0 || c >= nNodes() || nodes_[static_cast<size_t>(c)].parent != nd.id)
                 return false;
+            if (++incoming[static_cast<size_t>(c)] != 1) return false;
+        }
     }
+    for (const auto& nd : nodes_)
+        if (incoming[static_cast<size_t>(nd.id)] != (nd.parent == -1 ? 0 : 1))
+            return false;
+    std::vector<bool> seen(nodes_.size(), false);
+    std::vector<int64_t> stack{root()};
+    int64_t visited = 0;
+    while (!stack.empty()) {
+        const int64_t id = stack.back();
+        stack.pop_back();
+        if (seen[static_cast<size_t>(id)]) return false;
+        seen[static_cast<size_t>(id)] = true;
+        ++visited;
+        for (const int64_t c : nodes_[static_cast<size_t>(id)].children)
+            stack.push_back(c);
+    }
+    if (visited != nNodes()) return false;
     // 索引：不相交且并集 = [0, nTotal)
     std::vector<int64_t> all;
     all.reserve(static_cast<size_t>(nTotal));
@@ -102,7 +124,6 @@ bool SeparatorTree::validate(int64_t nTotal) const {
     for (int64_t i = 0; i < nTotal; ++i)
         if (all[static_cast<size_t>(i)] != i)
             return false;
-    // 无环（索引总数匹配 + 父子对称已足够,树形由构造保证）
     return true;
 }
 
