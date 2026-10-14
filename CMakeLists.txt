@@ -22,8 +22,14 @@ find_library(OPENBLAS_LIB NAMES openblas libopenblas
 # netlib LAPACK（静态）：dsygvd/dsygvx 等驱动例程无可变全局状态，
 # 可在线程池中并发调用（OpenMP 版 OpenBLAS 的并发 LAPACK 会互踩，实测慢 9 倍）。
 # 链接顺序必须 LAPACK 在前：其 BLAS 符号由 OpenBLAS 提供。
-find_library(NETLIB_LAPACK NAMES lapack liblapack
-             PATHS "D:/msys2/mingw64/lib" REQUIRED)
+option(AMLS_STATIC_LAPACK "Use static NETLIB LAPACK with adaptive OpenBLAS BLAS3 wrappers" ON)
+if(MINGW AND AMLS_STATIC_LAPACK)
+  find_file(NETLIB_LAPACK_STATIC NAMES liblapack.a
+            PATHS "D:/msys2/mingw64/lib" REQUIRED NO_DEFAULT_PATH)
+  set(NETLIB_LAPACK ${NETLIB_LAPACK_STATIC})
+else()
+  find_library(NETLIB_LAPACK NAMES lapack liblapack REQUIRED)
+endif()
 
 # Catch2 v3
 find_package(Catch2 3 REQUIRED CONFIG)
@@ -51,6 +57,9 @@ find_package(spdlog REQUIRED CONFIG)
 # ---------------------------------------------------------------------------
 file(GLOB_RECURSE AMLS_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 list(FILTER AMLS_SOURCES EXCLUDE REGEX "src/apps/")
+if(NOT (MINGW AND AMLS_STATIC_LAPACK))
+  list(FILTER AMLS_SOURCES EXCLUDE REGEX "src/linalg/lapack_blas\\.cpp$")
+endif()
 
 add_library(amls_lib STATIC ${AMLS_SOURCES})
 target_include_directories(amls_lib PUBLIC
@@ -65,6 +74,14 @@ target_link_libraries(amls_lib PUBLIC
 if(MINGW)
   target_link_libraries(amls_lib PUBLIC gfortran m gomp)
 endif()
+if(MINGW AND AMLS_STATIC_LAPACK)
+  # Force extraction from amls_lib even though the wrapped references first
+  # appear later, in the static LAPACK archive. Propagate to every executable.
+  target_link_options(amls_lib INTERFACE
+      "LINKER:--wrap=dgemm_,--wrap=dsyrk_,--wrap=dsyr2k_,--wrap=dtrsm_,--wrap=dtrmm_,--wrap=dsymm_,--wrap=dgemmtr_"
+      "LINKER:--undefined=__wrap_dgemm_,--undefined=__wrap_dsyrk_,--undefined=__wrap_dsyr2k_,--undefined=__wrap_dtrsm_,--undefined=__wrap_dtrmm_,--undefined=__wrap_dsymm_,--undefined=__wrap_dgemmtr_"
+  )
+endif()
 
 # ---------------------------------------------------------------------------
 # 应用
@@ -77,6 +94,9 @@ target_link_libraries(amls_verify PRIVATE amls_lib)
 
 add_executable(reference_tool src/apps/reference_tool.cpp)
 target_link_libraries(reference_tool PRIVATE amls_lib)
+
+add_executable(rea_tree_tool src/apps/rea_tree_tool.cpp)
+target_link_libraries(rea_tree_tool PRIVATE amls_lib)
 
 # ---------------------------------------------------------------------------
 # 测试

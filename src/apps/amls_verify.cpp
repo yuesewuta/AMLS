@@ -42,14 +42,20 @@ std::vector<Row> rows;
 
 void runCase(const std::string& name, amls::PencilPair pencil,
              const amls::DefaultTraits::Vector& lambdaRef, int64_t nev,
-             double eta, int nLevels, bool useShift, bool quiet = true,
+             double eta, int nLevels, bool quiet = true,
              int64_t leafSize = 500) {
     amls::AmlsOptions opt;
-    opt.nev = nev;
-    opt.thresholdFactor = eta;
     opt.nLevels = nLevels;
     opt.leafSize = leafSize;
-    opt.shift = useShift ? 1e-8 : 0.0;
+    // 频率制截断：maxFreq 取参考谱第 nev 阶对应频率（留 10% 带边余量，
+    // 带边模态的近似值可越过参考值），η 映射为增益系数 γ（局部截断
+    // (2π·γ·maxFreq)²），输出截到前 nev 阶（原 nev 制语义）。
+    const int64_t kRef =
+        std::min<int64_t>(nev, static_cast<int64_t>(lambdaRef.size()));
+    opt.maxFreq =
+        std::sqrt(lambdaRef[kRef - 1] * 1.10) / (2.0 * 3.14159265358979323846);
+    opt.gainCoefficient = eta;
+    opt.extractOrder = kRef;
     opt.verbosity = quiet ? 0 : 1;
 
     amls::Pencil<amls::DefaultTraits> km{pencil.K, pencil.M};
@@ -61,10 +67,7 @@ void runCase(const std::string& name, amls::PencilPair pencil,
     try {
         auto sol = solver.solve(km, opt);
         row.p = sol.reducedSize;
-        // 比较时把移位减掉
         amls::DefaultTraits::Vector theta = sol.eigenvalues;
-        if (useShift)
-            theta.array() -= opt.shift;
         const auto errs = amls::ErrorMetrics::eigenvalueRelErr(theta, lambdaRef);
         row.maxRelErr = 0;
         for (double e : errs)
@@ -196,25 +199,25 @@ int main(int argc, char** argv) {
             auto p = amls::pathGraph(2000);
             auto ref = amls::pathGraphSpectrum(2000);
             for (double eta : etas)
-                runCase("path2000", p, ref, nev, eta, 4, false);
+                runCase("path2000", p, ref, nev, eta, 4);
         }
         {
             auto p = amls::pathGraph(2000, true);
             auto ref = amls::pathGraphSpectrum(2000, true);
-            runCase("path2000-consM", p, ref, nev, 2.0, 4, false);
+            runCase("path2000-consM", p, ref, nev, 2.0, 4);
         }
         {
             auto p = amls::gridGraph2d(64, 64);
             auto ref = amls::gridGraph2dSpectrum(64, 64);
             for (double eta : etas)
                 // 叶块 1000（≈32×32 子网格）可解析目标模态波长;默认 500 时 η=2 误差 ~8%
-                runCase("grid64x64", p, ref, nev, eta, 4, false, true, 1000);
+                runCase("grid64x64", p, ref, nev, eta, 4, true, 1000);
         }
         {
             auto p = amls::pathGraph(500);
             auto ref = amls::pathGraphSpectrum(500);
             for (int L : levels)
-                runCase("path500", p, ref, nev, 2.0, L, false);
+                runCase("path500", p, ref, nev, 2.0, L);
         }
     }
 
@@ -261,7 +264,7 @@ int main(int argc, char** argv) {
                 amls::ReferenceSolver refSolver;
                 auto ref = refSolver.smallestEigenvalues(p.K, p.M, nev);
                 for (double eta : (quick ? std::vector<double>{2.0} : etas))
-                    runCase(nm, p, ref, nev, eta, 5, false);
+                    runCase(nm, p, ref, nev, eta, 5);
             } catch (const std::exception& e) {
                 std::cerr << "[verify] 跳过 " << nm << ": " << e.what() << "\n";
             }
