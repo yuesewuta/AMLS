@@ -23,8 +23,9 @@ benchmark/bin/
 benchmark/reference/
 benchmark/results/
 
-# Abaqus REA 逆向用安装/二进制目录（版权，不入库）
-rea/
+# Abaqus REA 逆向用安装/二进制目录（版权，不入库；仅仓库根目录，
+# 注意勿遮蔽 src/rea/ 源码）
+/rea/
 
 # PKU 版 AMLS 参考实现（仅本地参考，不纳入管理）
 third_party/amlsPKU/
