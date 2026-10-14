@@ -54,7 +54,9 @@ void LapackDenseEigensolver<T>::solveInterval(DenseMatrix& K, DenseMatrix& M,
     const int32_t itype = 1;
     const char jobz = 'V', uplo = 'L';
     const double vl = lo, vu = hi;
-    const int32_t il = 1, iu = 1;
+    // dsygvx 区间语义: 用值区间 [vl,vu] 时须设 IL=1, IU=N
+    // (同时给定 IL/IU 与 VL/VU 属未定义行为, 曾致 info=92 B 分解失败)。
+    const int32_t il = 1, iu = n;
     const double abstol = 0.0;
     int32_t m = 0, info = 0;
 

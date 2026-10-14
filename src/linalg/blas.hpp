@@ -1,8 +1,11 @@
 #pragma once
 // OpenBLAS CBLAS 封装（列主序 = Eigen 默认布局）。
 // 转置通过 CblasTrans/CblasNoTrans 标志“隐式”完成，不物化转置副本。
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <functional>
+#include <utility>
 
 #include <openblas/cblas.h>
 
@@ -62,6 +65,7 @@ inline void addMul(CBLAS_TRANSPOSE ta, CBLAS_TRANSPOSE tb,
 /// 工程未以 -fopenmp 编译（_OPENMP 不存在），直接声明 libgomp 的 C 接口
 /// （libgomp-1.dll 随 OpenBLAS 常驻进程）。
 extern "C" void omp_set_num_threads(int);
+extern "C" int omp_get_max_threads();
 inline void setNumThreads(int t) {
     openblas_set_num_threads(t);
     omp_set_num_threads(t);
@@ -72,57 +76,111 @@ inline void setNumThreads(int t) {
 /// 核数，BLAS 在其上仍全开核 → 过度订阅）。工作线程入口必须各调一次。
 inline void pinThisThread() { omp_set_num_threads(1); }
 
-// ---- 大任务内部临时放开 BLAS 多线程（尾部单任务占满多核）----
-// 观测（250k trace）：收尾 ~15.4s（占 wall 10%）就绪队列空、单任务 3–5.5s
-// 独占 1 核。方案 = 就绪队列空闸（starved）+ 按规模阈值 + 全局同时只允许
-// 一个 MT 任务（atomic_flag，防 12 个大任务各拉 8 线程打爆核）。
-extern thread_local bool tls_starved;      // DagRunner 弹出任务时更新
-extern std::atomic_flag g_mtBudgetLock;    // MT 预算互斥（try_lock 非阻塞）
+// BLAS 内部线程与手工列拆分共用一份非阻塞预算。回调仅在 DAG worker
+// 上安装；acquire 在调度器锁内授予总线程数并登记额外线程，release 归还。
+extern thread_local bool tls_starved;
+extern thread_local bool tls_budgetActive;
+extern thread_local std::function<int()> tls_availableThreads;
+extern thread_local std::function<int(int)> tls_acquireThreads;
+extern thread_local std::function<void(int)> tls_releaseThreads;
+extern std::atomic_flag g_mtBudgetLock;
+
+inline bool adaptationEnabled() {
+    return std::getenv("AMLS_NO_ADAPT") == nullptr;
+}
+
+inline int availableThreads() {
+    if (!adaptationEnabled()) return 1;
+    return tls_availableThreads ? tls_availableThreads() : 1;
+}
+
+// 仅预留容量，不修改 OpenMP ICV。必须在取得预算的同一 worker 上析构；
+// 持有者只能等待自己的辅助线程，不能等待尚在 DAG 队列中的任务。
+struct ScopedReservation {
+    bool active = false;
+    int threads = 1;
+    static inline std::atomic<int64_t> nBudgetGranted{0};
+    static inline std::atomic<int64_t> nBudgetContended{0};
+    static inline std::atomic<int64_t> nHungry{0};
+
+    explicit ScopedReservation(int k) {
+        if (std::getenv("AMLS_NO_MT") || !adaptationEnabled() ||
+            tls_budgetActive || k <= 1 || !tls_acquireThreads ||
+            !tls_releaseThreads)
+            return;
+        // 先复制归还回调，避免登记容量后 std::function 分配失败漏还。
+        release_ = tls_releaseThreads;
+        nHungry.fetch_add(1, std::memory_order_relaxed);
+        if (g_mtBudgetLock.test_and_set(std::memory_order_acquire)) {
+            nBudgetContended.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // 锁顺序只有预算 try_lock → DAG qm；qm 持有者从不获取预算锁。
+        try {
+            threads = tls_acquireThreads(k);
+        } catch (...) {
+            g_mtBudgetLock.clear(std::memory_order_release);
+            throw;
+        }
+        if (threads <= 1) {
+            threads = 1;
+            g_mtBudgetLock.clear(std::memory_order_release);
+            return;
+        }
+        tls_budgetActive = true;
+        active = true;
+        nBudgetGranted.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~ScopedReservation() {
+        if (active) {
+            release_(threads - 1);
+            tls_budgetActive = false;
+            g_mtBudgetLock.clear(std::memory_order_release);
+        }
+    }
+    ScopedReservation(const ScopedReservation&) = delete;
+    ScopedReservation& operator=(const ScopedReservation&) = delete;
+    ScopedReservation(ScopedReservation&& o) noexcept
+        : active(o.active), threads(o.threads), release_(std::move(o.release_)) {
+        o.active = false;
+        o.threads = 1;
+    }
+    ScopedReservation& operator=(ScopedReservation&&) = delete;
+
+private:
+    std::function<void(int)> release_;
+};
 
 struct ScopedBudget {
     bool active = false;
     int saved = 1;
-    /// 诊断计数（AMLS_DEBUG_ADAPT）：预算获取成功次数 / 饥饿但被互斥
-    /// 挡掉次数 / 饥饿判定通过次数。
-    static inline std::atomic<int64_t> nBudgetGranted{0};
-    static inline std::atomic<int64_t> nBudgetContended{0};
-    static inline std::atomic<int64_t> nHungry{0};
-    explicit ScopedBudget(int k) {
-        static const bool mtEnabled = std::getenv("AMLS_NO_MT") == nullptr;
-        if (!mtEnabled || !tls_starved || k <= 1)
-            return;
-        nHungry.fetch_add(1, std::memory_order_relaxed);
-        if (g_mtBudgetLock.test_and_set(std::memory_order_acquire)) {
-            nBudgetContended.fetch_add(1, std::memory_order_relaxed);
-            return;   // 已有别的任务持有 MT 预算，本次保持单线程
-        }
-        nBudgetGranted.fetch_add(1, std::memory_order_relaxed);
-        saved = 1;
-        omp_set_num_threads(k);
+    static inline auto& nBudgetGranted = ScopedReservation::nBudgetGranted;
+    static inline auto& nBudgetContended = ScopedReservation::nBudgetContended;
+    static inline auto& nHungry = ScopedReservation::nHungry;
+    explicit ScopedBudget(int k) : reservation_(k) {
+        if (!reservation_.active) return;
+        saved = omp_get_max_threads();
+        omp_set_num_threads(reservation_.threads);
         active = true;
     }
     ~ScopedBudget() {
-        if (active) {
-            omp_set_num_threads(saved);
-            g_mtBudgetLock.clear(std::memory_order_release);
-        }
+        // 先恢复 ICV，再由 reservation_ 析构归还容量与全局互斥预算。
+        if (active) omp_set_num_threads(saved);
     }
     ScopedBudget(const ScopedBudget&) = delete;
     ScopedBudget& operator=(const ScopedBudget&) = delete;
     ScopedBudget(ScopedBudget&& o) noexcept
-        : active(o.active), saved(o.saved) { o.active = false; }
-    ScopedBudget& operator=(ScopedBudget&& o) noexcept {
-        if (this != &o) {
-            if (active) { omp_set_num_threads(saved); g_mtBudgetLock.clear(std::memory_order_release); }
-            active = o.active; saved = o.saved; o.active = false;
-        }
-        return *this;
+        : active(o.active), saved(o.saved), reservation_(std::move(o.reservation_)) {
+        o.active = false;
     }
+    ScopedBudget& operator=(ScopedBudget&&) = delete;
+
+private:
+    ScopedReservation reservation_;
 };
 
-/// 规模阈值（GFLOP）：约 2 GFLOP（单核 ~30ms）以上的 GEMM 才值得开多线程。
 inline ScopedBudget maybeBudget(double gflops, int k = 8) {
-    return ScopedBudget(gflops > 2.0 ? k : 1);
+    return ScopedBudget(gflops > 0.5 ? k : 1);
 }
 
 } // namespace blas

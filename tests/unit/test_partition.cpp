@@ -99,3 +99,147 @@ TEST_CASE("separator_tree 遍历正确", "[tree]") {
     REQUIRE(desc.size() == 2);
     REQUIRE(t.validate(5));
 }
+
+TEST_CASE("NodeND 单次嵌套剖分：树校验 + 边-祖先性", "[partition][nd]") {
+    auto p = gridGraph2d(20, 20);
+    MetisPartitioner<DefaultTraits> part;
+    auto res = part.nestedDissection(p.K + p.M, 60);
+    const int64_t n = p.K.rows();
+    REQUIRE(res.tree.validate(n));
+    // perm 是 [0,n) 的排列
+    std::vector<int64_t> s(res.perm);
+    std::sort(s.begin(), s.end());
+    for (int64_t i = 0; i < n; ++i)
+        REQUIRE(s[static_cast<size_t>(i)] == i);
+    // 边-祖先性（AMLS 有效性条件）：任一边 (u,v) 两端所在节点
+    // 在树上必须可比（一方是另一方祖先，或同节点）
+    std::vector<int64_t> nodeOf(n, -1);
+    for (int64_t id = 0; id < res.tree.nNodes(); ++id)
+        for (const int64_t v : res.tree.node(id).indices)
+            nodeOf[static_cast<size_t>(v)] = id;
+    auto comparable = [&](int64_t a, int64_t b) {
+        for (int64_t x = a; x != -1; x = res.tree.node(x).parent)
+            if (x == b) return true;
+        for (int64_t x = b; x != -1; x = res.tree.node(x).parent)
+            if (x == a) return true;
+        return false;
+    };
+    SM A = p.K + p.M;
+    for (int64_t c = 0; c < n; ++c)
+        for (SM::InnerIterator it(A, c); it; ++it)
+            if (it.row() != c)
+                REQUIRE(comparable(nodeOf[it.row()], nodeOf[c]));
+    // 叶规模：分组阈值 60 ⇒ 网格图上叶应处于阈值同量级
+    int64_t maxLeaf = 0;
+    for (int64_t id = 0; id < res.tree.nNodes(); ++id)
+        if (res.tree.node(id).role == NodeRole::Leaf)
+            maxLeaf = std::max<int64_t>(
+                maxLeaf, static_cast<int64_t>(res.tree.node(id).indices.size()));
+    REQUIRE(maxLeaf >= 60);
+    REQUIRE(maxLeaf <= 4 * 60);
+}
+
+TEST_CASE("NodeND 退化情形：整图小于阈值 → 单叶根", "[partition][nd]") {
+    auto p = pathGraph(37);
+    MetisPartitioner<DefaultTraits> part;
+    auto res = part.nestedDissection(p.K + p.M, 500);
+    REQUIRE(res.tree.validate(p.K.rows()));
+    REQUIRE(res.tree.nNodes() == 1);
+    REQUIRE(res.tree.node(0).role == NodeRole::Leaf);
+}
+
+TEST_CASE("NodeND storage variants preserve tree and ancestor edges", "[partition][nd]") {
+    auto p = gridGraph2d(9, 9);
+    SM full = p.K + p.M;
+    SM lower = full.triangularView<Eigen::Lower>();
+    SM upper = full.triangularView<Eigen::Upper>();
+    SM uncompressed(full.rows(), full.cols());
+    uncompressed.reserve(Eigen::VectorXi::Constant(full.cols(), 12));
+    for (int64_t c = 0; c < full.cols(); ++c)
+        for (SM::InnerIterator it(full, c); it; ++it)
+            uncompressed.insert(it.row(), c) = it.value();
+    REQUIRE_FALSE(uncompressed.isCompressed());
+    MetisPartitioner<DefaultTraits> part;
+    auto reference = part.nestedDissection(full, 6);
+    for (const SM* input : {&lower, &upper, &uncompressed}) {
+        auto result = part.nestedDissection(*input, 6);
+        REQUIRE(result.tree.validate(full.rows()));
+        REQUIRE(result.perm == reference.perm);
+        int64_t off = 0;
+        for (int64_t id : result.tree.postOrder()) {
+            for (int64_t v : result.tree.node(id).indices)
+                REQUIRE(result.perm[static_cast<size_t>(off++)] == v);
+        }
+    }
+}
+
+TEST_CASE("NodeND disconnected graph and isolated vertices", "[partition][nd]") {
+    auto grid = gridGraph2d(7, 7);
+    const int64_t n = 2 * grid.K.rows() + 3;
+    SM A(n, n);
+    std::vector<Eigen::Triplet<double, int64_t>> trips;
+    for (int64_t shift : {int64_t(0), grid.K.rows()})
+        for (int64_t c = 0; c < grid.K.cols(); ++c)
+            for (SM::InnerIterator it(grid.K, c); it; ++it)
+                trips.emplace_back(shift + it.row(), shift + c, it.value());
+    for (int64_t i = n - 3; i < n; ++i) trips.emplace_back(i, i, 1.0);
+    A.setFromTriplets(trips.begin(), trips.end());
+    MetisPartitioner<DefaultTraits> part;
+    auto res = part.nestedDissection(A, 4);
+    REQUIRE(res.tree.validate(n));
+    std::vector<int64_t> nodeOf(n, -1);
+    for (int64_t id = 0; id < res.tree.nNodes(); ++id)
+        for (int64_t v : res.tree.node(id).indices) nodeOf[v] = id;
+    for (int64_t c = 0; c < n; ++c)
+        for (SM::InnerIterator it(A, c); it; ++it) {
+            auto left = res.tree.ancestors(nodeOf[it.row()]);
+            auto right = res.tree.ancestors(nodeOf[c]);
+            REQUIRE((nodeOf[it.row()] == nodeOf[c] ||
+                     std::find(left.begin(), left.end(), nodeOf[c]) != left.end() ||
+                     std::find(right.begin(), right.end(), nodeOf[it.row()]) != right.end()));
+        }
+}
+
+TEST_CASE("Separator tree rejects duplicate children and disconnected cycles", "[tree]") {
+    SeparatorTree duplicate;
+    auto leaf = duplicate.addNode(NodeRole::Leaf, {0});
+    auto root = duplicate.addNode(NodeRole::Root, {1});
+    duplicate.setChildren(root, leaf, leaf);
+    duplicate.setParent(leaf, root);
+    REQUIRE_FALSE(duplicate.validate(2));
+
+    SeparatorTree disconnected;
+    disconnected.addNode(NodeRole::Leaf, {0});
+    auto a = disconnected.addNode(NodeRole::Separator, {1});
+    auto b = disconnected.addNode(NodeRole::Separator, {2});
+    auto al = disconnected.addNode(NodeRole::Leaf, {3});
+    auto bl = disconnected.addNode(NodeRole::Leaf, {4});
+    disconnected.setChildren(a, b, al); disconnected.setParent(b, a); disconnected.setParent(al, a);
+    disconnected.setChildren(b, a, bl); disconnected.setParent(a, b); disconnected.setParent(bl, b);
+    REQUIRE_FALSE(disconnected.validate(5));
+}
+
+
+TEST_CASE("NodeND 大网格回归：深消去树下树校验", "[partition][nd]") {
+    auto p = gridGraph2d(80, 80);
+    MetisPartitioner<DefaultTraits> part;
+    auto res = part.nestedDissection(p.K + p.M, 40);
+    const int64_t n = p.K.rows();
+    REQUIRE(res.tree.validate(n));
+    std::vector<int64_t> nodeOf(n, -1);
+    for (int64_t id = 0; id < res.tree.nNodes(); ++id)
+        for (const int64_t v : res.tree.node(id).indices)
+            nodeOf[static_cast<size_t>(v)] = id;
+    auto comparable = [&](int64_t a, int64_t b) {
+        for (int64_t x = a; x != -1; x = res.tree.node(x).parent)
+            if (x == b) return true;
+        for (int64_t x = b; x != -1; x = res.tree.node(x).parent)
+            if (x == a) return true;
+        return false;
+    };
+    SM A = p.K + p.M;
+    for (int64_t c = 0; c < n; ++c)
+        for (SM::InnerIterator it(A, c); it; ++it)
+            if (it.row() != c)
+                REQUIRE(comparable(nodeOf[it.row()], nodeOf[c]));
+}
