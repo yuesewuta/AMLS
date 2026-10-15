@@ -1,6 +1,7 @@
 #include "amls/node_task_executor.hpp"
 
 #include <cmath>
+#include <fstream>
 #include <cstdio>
 #include <exception>
 
@@ -131,8 +132,11 @@ bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {
     if (!shouldRun) return true;
 
     bool ok = false;
-    try {
-        DenseMatrix K, M;
+    DenseMatrix K, M;
+    // 就地重装载局部块。dsygvx 会破坏 A/B（B 变 Cholesky 因子、A 变标准化
+    // 矩阵）：空区间回退 solveIndex 前必须重取原始块，否则对三角因子再做
+    // 分解会得到 info=N+i 的假失败。
+    auto loadBlocks = [&]() -> bool {
         if (nd.children.empty()) {
             // 叶子：原始对角子块转稠密（局部行号 = 升序索引位置）。
             K = DenseMatrix(cfg_.blocks->diagK(nodeID));
@@ -142,12 +146,34 @@ bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {
             const DenseMatrix* dm = gauss_.getReducedDiagM(nodeID);
             if (dk == nullptr || dm == nullptr) {
                 AMLS_LOG_ERROR("局部特征求解节点 {} 约化对角块不可读。", nodeID);
-            } else {
-                K = *dk;  // 求解覆盖入参，取副本
-                M = *dm;
+                return false;
+            }
+            K = *dk;  // 求解覆盖入参，取副本
+            M = *dm;
+        }
+        return K.rows() > 0 && K.rows() == K.cols() && M.rows() == K.rows();
+    };
+    try {
+        ok = loadBlocks();
+        if (ok && std::getenv("AMLS_DUMP_REDUCED_NODES") != nullptr) {
+            // 诊断: 转储指定节点的约化对角块（AMLS_DUMP_REDUCED_NODES="656,2532"）
+            const std::string want = std::getenv("AMLS_DUMP_REDUCED_NODES");
+            if (want.find(std::to_string(nodeID)) != std::string::npos) {
+                const std::string tag = std::to_string(nodeID) + "_n" +
+                                        std::to_string(K.rows());
+                std::ofstream fk("reduced_" + tag + "_K.bin",
+                                 std::ios::binary);
+                fk.write(reinterpret_cast<const char*>(K.data()),
+                         static_cast<std::streamsize>(K.size() * sizeof(double)));
+                std::ofstream fm("reduced_" + tag + "_M.bin",
+                                 std::ios::binary);
+                fm.write(reinterpret_cast<const char*>(M.data()),
+                         static_cast<std::streamsize>(M.size() * sizeof(double)));
+                std::fprintf(stderr, "[dump] node=%lld n=%lld written K/M bins\n",
+                             static_cast<long long>(nodeID),
+                             static_cast<long long>(K.rows()));
             }
         }
-        ok = K.rows() > 0 && K.rows() == K.cols() && M.rows() == K.rows();
         if (!ok)
             AMLS_LOG_ERROR("局部特征求解节点 {} 子块形状非法。", nodeID);
         if (ok) {
@@ -156,7 +182,9 @@ bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {
             cfg_.dense->solveInterval(K, M, -1e300, cfg_.lambdaHi, w, V);
             if (w.size() == 0 && cfg_.minExtractOrder > 0) {
                 // 区间空回退：保留最低 minExtractOrder 阶（对齐 PKU
-                // allowZeroEigenPair=false 语义）。
+                // allowZeroEigenPair=false 语义）。solveInterval 已就地
+                // 破坏 K/M，先重装载再解。
+                loadBlocks();
                 const int64_t keep =
                     std::min<int64_t>(cfg_.minExtractOrder, K.rows());
                 cfg_.dense->solveIndex(K, M, 1, keep, w, V);
@@ -176,7 +204,19 @@ bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {
                 AMLS_LOG_ERROR("局部特征求解节点 {} 特征对提交失败。", nodeID);
         }
     } catch (const std::exception& e) {
-        AMLS_LOG_ERROR("局部特征求解节点 {} 异常：{}", nodeID, e.what());
+        {
+            int64_t badK = 0, badM = 0;
+            for (int64_t i = 0; i < K.size(); ++i) {
+                const double kv = K.data()[i], mv = M.data()[i];
+                if (!std::isfinite(kv)) ++badK;
+                if (!std::isfinite(mv)) ++badM;
+            }
+            AMLS_LOG_ERROR(
+                "局部特征求解节点 {} 异常：{} (n={}, leaf={}, nonfinite K={}, "
+                "M={})",
+                nodeID, e.what(), K.rows(),
+                nd.children.empty() ? 1 : 0, badK, badM);
+        }
         ok = false;
     }
     return finishTask(states_, nodeID, NodeTaskKind::SolveLocalEigenPair, ok);

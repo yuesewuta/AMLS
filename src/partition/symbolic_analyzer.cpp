@@ -61,31 +61,22 @@ FactorMeta analyzeWithEigen(const SparseMatrix& A,
                      (int)ldl.info(), (long long)n, (long long)Bl.nonZeros());
         throw std::runtime_error("symbolic_analyzer: analyzePattern 失败");
     }
-    if (std::getenv("AMLS_DUMP_TREE")) {
-        // 数值分解以物化 L 结构（SPD 保证成功）
-        ldl.factorize(Bl);
-        if (ldl.info() == Eigen::Success) {
-            const auto& Lv = ldl.matrixL();
-            Eigen::SparseMatrix<double, Eigen::ColMajor, int64_t> L = Lv;
-            std::fprintf(stderr, "[sym] L nnz=%lld (from numeric factor)\n",
-                         (long long)L.nonZeros());
-            return extractFactorMeta(L, n);
-        }
-        // factorize 失败后 matrixL() 处于部分分解的脏状态，直接读会得到
-        // 错误的 parent/columnCount（表现为 etree 几乎全根、全 1-DOF 块）；
-        // 必须用新对象重做纯符号分析拿干净的 L pattern。
-        std::fprintf(stderr, "[sym] factorize 失败, 用纯符号 analyzePattern 结构\n");
-        LdlT fresh;
-        fresh.analyzePattern(Bl);
-        if (fresh.info() != Eigen::Success)
-            throw std::runtime_error("symbolic_analyzer: 符号分析失败");
-        const auto& Lf = fresh.matrixL();
-        Eigen::SparseMatrix<double, Eigen::ColMajor, int64_t> L = Lf;
-        return extractFactorMeta(L, n);
+    // 必须数值分解：analyzePattern 只填 L 的列计数（outerIndexPtr），行索引
+    // innerIndexPtr 由 factorize 才写入（Eigen init_matrix 只 partial_sum +
+    // resizeNonZeros）。只 analyze 就读 matrixL 的 inner 是未初始化内存，
+    // 表现为 etree 几乎全根、全 1-DOF 块。K+M（lumped M>0）SPD 保证成功。
+    ldl.factorize(Bl);
+    if (ldl.info() != Eigen::Success) {
+        std::fprintf(stderr,
+                     "[sym] factorize 失败 info=%d n=%lld（要求 SPD 的 K+M）\n",
+                     (int)ldl.info(), (long long)n);
+        throw std::runtime_error("symbolic_analyzer: factorize 失败");
     }
-    // 无数值时: analyzePattern 后 L 结构来自 symbolic，仍是完整 pattern
     const auto& Lv = ldl.matrixL();
     Eigen::SparseMatrix<double, Eigen::ColMajor, int64_t> L = Lv;
+    if (std::getenv("AMLS_DUMP_TREE"))
+        std::fprintf(stderr, "[sym] L nnz=%lld (from numeric factor)\n",
+                     (long long)L.nonZeros());
     return extractFactorMeta(L, n);
 }
 
