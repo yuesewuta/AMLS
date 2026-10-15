@@ -195,6 +195,7 @@ AmlsSolver::Solution AmlsSolver::solve(const PencilT& KM,
         ropt.maxBlockDofs = optN.reaMaxBlockDofs;
         ropt.collapseMaxDofs = optN.reaCollapseDofs;
         ropt.leafAggrMaxDofs = optN.reaLeafAggrDofs;
+        ropt.dofsPerNode = optN.reaDofsPerNode;
         ropt.superRootDofs = n;   // 允许多根森林合成空 DOF 超根
         part = rea::buildAbaqusTree(KM.K + KM.M, ropt);
     } else {

@@ -29,6 +29,9 @@ Abaqus 有完整的**自底向上聚合链**（Collapse2 折叠 + AggregateLeave
 │ std_OrderingHandler::GenerateOrder → slv_SolverOptimizer::NewOrder    │
 │   （内部 METIS_NodeND / ParMETIS，受 ABA_FORCE_PARMETIS 开关）        │
 │ 输出: 排列 perm[new]=old                                              │
+│ ★ 网格节点图收缩: NodeND 在网格节点图（每节点 dp=3 DOF 收缩为一个顶点） │
+│   上跑，DOF 排列 = 节点排列按 dp 展开 —— stf 块大小全为 3 的倍数       │
+│   （cant_20: 3:6739/6:1033/9:70/12:48/18:5/24:3）即为证据              │
 ├─ 2. 标量消去树 etree ────────────────────────────────────────────────┤
 │ std_BuildTreeAfterMetis（std_pamsDriver 阶段 "BUILD TREE AFTER METIS"）│
 │   用 Liu 经典算法对排序后邻接图建 etree（prev[] 链归并）[R: 13638-67] │
@@ -36,6 +39,10 @@ Abaqus 有完整的**自底向上聚合链**（Collapse2 折叠 + AggregateLeave
 ├─ 3. 符号分解 + 基础超节点 ───────────────────────────────────────────┤
 │ pme_SymbolicFactor::BuildTree（再建 etree）+ CreateFundamentalSuperNodes│
 │   exact 判据: parent(j)=j+1 && 列模式相同 → 同一基础超节点             │
+│   ★ 以网格节点为原子：节点层符号分析（A_n = Rᵀ A R，dp×dp dof 块求和， │
+│   R 为节点→dof 聚合，SPD 保持），基础超节点以节点为单位再展开为 dof 块  │
+│   若在 dof 层做消除分析，导出 mtx 丢失的组内小耦合会让三重奏被拆开      │
+│   （cant_20 实测: 1495/8820 节点缺 (0,1)/(0,2) 对、7 组全缺）          │
 ├─ 4. 聚合（本设计的核心引入项）───────────────────────────────────────┤
 │ Collapse2:      子数==1 且总大小<LEAF_SN_LIMIT(120) 的节点折叠进父     │
 │                 （ABA_PAMS_SN_COLLAPSE=2 控制）[R: Collapse2 101821]  │
@@ -49,6 +56,27 @@ Abaqus 有完整的**自底向上聚合链**（Collapse2 折叠 + AggregateLeave
  pme_AmsSymbolicFactor::ComputeSubTreesNew → pme_TrimSubstructureTree
    → pme_SmpReducedEigenSolver（缩聚求解用修剪后的子树）
 ```
+
+### 1.2.1 网格节点图收缩的实现（`tree_builder.cpp`）
+
+**证据链**：Abaqus cant_20 的 stf 块大小分布 3:6739/6:1033/9:70/12:48/18:5/24:3
+（7898 块、27783=9261×3 DOF）全部为 3 的倍数 → NodeND 的顶点是网格节点
+（每节点 3 DOF）而非单个 DOF；基础超节点以节点为原子。
+
+**实现**（`opt.dofsPerNode`，0=自动/1=逐 dof/3=强制）：
+1. 自动检测：`n % 3 == 0` 且组内耦合边覆盖率 ≥99%（Abaqus 导出 mtx 会丢弃
+   数值极小的跨向耦合，cant_20 中 1495/8820 节点缺 (0,1)/(0,2) 对、7 组全缺；
+   缺失耦合由消元填充补回，不影响 3-DOF 超节点形成）→ dp=3，否则逐 dof；
+2. METIS_NodeND 跑在节点图上（节点邻接 = 任意 dof 边的节点级去重）；
+3. 节点层符号分析：`A_n = Rᵀ A R`（dp×dp dof 块求和；A SPD ⇒ A_n SPD，
+   可安全数值 factorize），exact 判据在节点列上判 → 基础超节点节点对齐；
+4. 节点块 [b,e) → dof 块 [dp·b, dp·e)（展开后连续），blockOfColumn 同步
+   重建为 dof 层；下游 Collapse2/AggregateLeaves/4096 截断全在 dof 单位。
+
+**实测（cant_20, 26460 dof）**：base 3:8788 + 6:16（8804 块，全部 3 的倍数；
+对比 Abaqus stf 7898 块同形态）；聚合后 2601 块（3:1848/6:290/9:78/12:94/
+…最大 120），K 全边祖先可比计数=0。cant_31（95232 dof）: base 3:31670/6:7/
+9:20（31697 块 vs Abaqus stf 29488 块），聚合后 8859 块，可比计数=0。
 
 ### 1.3 树构造一致性判据（验证标准）
 

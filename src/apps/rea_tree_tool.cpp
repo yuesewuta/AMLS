@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
         else if (s == "--no-aggr-leaves") opt.aggregateLeaves = false;
         else if (s == "--no-collapse") opt.collapseMode = 0;
         else if (s == "--super-root-dofs") opt.superRootDofs = std::stoll(next());
+        else if (s == "--dofs-per-node") opt.dofsPerNode = std::stoi(next());
         else { std::fprintf(stderr, "unknown arg %s\n", s.c_str()); return 2; }
     }
     DefaultTraits::SparseMatrix K, M;

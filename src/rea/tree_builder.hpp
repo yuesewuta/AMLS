@@ -20,6 +20,15 @@ struct AbaqusTreeOptions {
     // ---- METIS 排序 ----
     int metisSeed = 42;
 
+    // ---- 网格节点图收缩 ----
+    // Abaqus 的 stf 块分布（cant_20: 3:6739/6:1033/…，最大 24）表明 NodeND
+    // 在网格节点图上排序（每节点 dofsPerNode 个 DOF 收缩为一个顶点），DOF
+    // 排列 = 节点排列展开；逐 DOF 排序会把同一节点的三重奏打散，exact 超
+    // 节点退化成大量 1-DOF 块。
+    //   0 = 自动：n%3==0 且全部三重奏组内两两耦合时按 3 收缩，否则逐 DOF；
+    //   1 = 强制逐 DOF；3（或其它）= 强制按该宽度收缩（校验失败则报错）。
+    int dofsPerNode = 0;
+
     // ---- 基础超节点 ----
     int64_t maxBlockDofs = 4096;   // Abaqus UPPER_CUTOFF（dat "MAXIMUM SIZE OF A
                                    // SUBSTRUCTURE 4096"）

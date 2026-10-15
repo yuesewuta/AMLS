@@ -108,6 +108,7 @@ void usage(int exitCode = 2) {
         "      --reduced pku|rea  (REA 缩聚特征阶段: 蒸馏+子空间迭代+Ritz)\n"
         "      --cutoff2 C --cutoff3 C --shift S (REA 蒸馏参数, <=0 跟随 --eta)\n"
         "      --rea-block-dofs B --rea-collapse-dofs C --rea-leaf-aggr-dofs L\n"
+        "      --rea-dofs-per-node N  (REA 网格节点收缩宽度: 0=自动 3, 1=逐 DOF)\n"
         "      --no-subspace-iter  (REA: 关闭子空间迭代, 直接广义 Ritz)\n"
         "      --no-recover --quiet --out FILE\n"
         "      --help\n" << std::flush;
@@ -176,6 +177,7 @@ Args parse(int argc, char** argv) {
         else if (s == "--rea-block-dofs") a.opt.reaMaxBlockDofs = std::stoll(next());
         else if (s == "--rea-collapse-dofs") a.opt.reaCollapseDofs = std::stoll(next());
         else if (s == "--rea-leaf-aggr-dofs") a.opt.reaLeafAggrDofs = std::stoll(next());
+        else if (s == "--rea-dofs-per-node") a.opt.reaDofsPerNode = std::stoi(next());
         else if (s == "--no-subspace-iter") a.opt.subspaceIteration = false;
         else if (s == "--threads") a.opt.numThreads = std::stoi(next());
         else if (s == "--no-recover") a.opt.recoverVectors = false;

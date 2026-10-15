@@ -68,6 +68,63 @@ Csr extractGraph(const DefaultTraits::SparseMatrix& A) {
     return g;
 }
 
+// 网格节点图：把连续 dp 个 DOF 收缩为一个顶点（同一网格节点的 DOF 通过
+// 泊松耦合两两相连，构成 dp×dp 稠密对角块）。边双向收集后逐顶点去重。
+Csr extractNodeGraph(const DefaultTraits::SparseMatrix& A, int64_t dp,
+                     int64_t nv) {
+    DefaultTraits::SparseMatrix compressed = A;
+    compressed.makeCompressed();
+    std::vector<std::vector<idx_t>> adj(static_cast<size_t>(nv));
+    for (int64_t c = 0; c < compressed.rows(); ++c) {
+        const int64_t nc = c / dp;
+        for (DefaultTraits::SparseMatrix::InnerIterator it(compressed, c); it;
+             ++it) {
+            const int64_t r = it.row();
+            if (r == c) continue;
+            const int64_t nr = r / dp;
+            if (nr == nc) continue;
+            adj[static_cast<size_t>(nr)].push_back(static_cast<idx_t>(nc));
+            adj[static_cast<size_t>(nc)].push_back(static_cast<idx_t>(nr));
+        }
+    }
+    Csr g;
+    g.xadj.assign(static_cast<size_t>(nv) + 1, 0);
+    for (int64_t v = 0; v < nv; ++v) {
+        auto& a = adj[static_cast<size_t>(v)];
+        std::sort(a.begin(), a.end());
+        a.erase(std::unique(a.begin(), a.end()), a.end());
+        g.adjncy.insert(g.adjncy.end(), a.begin(), a.end());
+        g.xadj[static_cast<size_t>(v) + 1] =
+            static_cast<idx_t>(g.adjncy.size());
+    }
+    return g;
+}
+
+// 连续 dp 分组布局检测：n % dp == 0 且组内耦合边覆盖率 ≥99%。
+// 不要求组内两两全耦合：Abaqus 导出的 mtx 会丢弃数值极小的跨向耦合
+// （cant_20 中 1495/8820 节点缺 (0,1)/(0,2) 对、7 组全缺），缺失的耦合
+// 由符号分析阶段的消元填充补回，不影响 3-DOF 超节点形成。
+bool detectGroupedLayout(const DefaultTraits::SparseMatrix& A, int64_t dp) {
+    const int64_t n = A.rows();
+    if (n % dp != 0) return false;
+    std::vector<uint8_t> hasEdge(static_cast<size_t>(n / dp), 0);
+    for (int64_t c = 0; c < n; ++c) {
+        const int64_t t = c / dp;
+        if (hasEdge[static_cast<size_t>(t)]) continue;
+        for (DefaultTraits::SparseMatrix::InnerIterator it(A, c); it; ++it)
+            if (it.row() / dp == t && it.row() != c) {
+                hasEdge[static_cast<size_t>(t)] = 1;
+                break;
+            }
+    }
+    int64_t nEmpty = 0;
+    for (uint8_t e : hasEdge)
+        if (!e) ++nEmpty;
+    // 容忍 ≤1% 的孤立组（导出丢值），仍有组内边的组 ≥99% 即认定分组布局
+    return nEmpty * 100 <= static_cast<int64_t>(hasEdge.size());
+}
+
+
 }  // namespace
 
 IPartitioner<DefaultTraits>::Result buildAbaqusTree(
@@ -77,10 +134,25 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
     Result res;
     if (n == 0) return res;
 
-    // ---- 1. METIS_NodeND 排列（GenerateOrder ↣ NodeND）----
-    Csr g = extractGraph(A);
-    idx_t nvtxs = static_cast<idx_t>(n);
-    std::vector<idx_t> mperm(static_cast<size_t>(n)), iperm(static_cast<size_t>(n));
+    // ---- 1. 网格节点图收缩 + METIS_NodeND 排列（GenerateOrder ↣ NodeND）----
+    // Abaqus 在网格节点图上跑 NodeND（stf 块以 3-DOF 为主），DOF 排列 =
+    // 节点排列按 dp 展开成 perm[new]=old。
+    int dp = opt.dofsPerNode;
+    if (dp <= 0) {
+        dp = 1;
+        if (n % 3 == 0 && detectGroupedLayout(A, 3)) dp = 3;
+        if (std::getenv("AMLS_DUMP_TREE"))
+            std::fprintf(stderr, "[rea-tree] 自动节点收缩宽度 dp=%d\n", dp);
+    } else if (dp > 1 &&
+               !(n % dp == 0 && detectGroupedLayout(A, dp))) {
+        throw std::runtime_error(
+            "rea::buildAbaqusTree: dofsPerNode=" + std::to_string(dp) +
+            " 布局校验失败（n 不整除或组内 dofs 未两两耦合）");
+    }
+    const int64_t nv = dp > 1 ? n / dp : n;
+    Csr g = dp > 1 ? extractNodeGraph(A, dp, nv) : extractGraph(A);
+    idx_t nvtxs = static_cast<idx_t>(nv);
+    std::vector<idx_t> mperm(static_cast<size_t>(nv)), iperm(static_cast<size_t>(nv));
     idx_t opts[METIS_NOPTIONS];
     METIS_SetDefaultOptions(opts);
     opts[METIS_OPTION_SEED] = opt.metisSeed;
@@ -89,13 +161,44 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
     if (r != METIS_OK)
         throw std::runtime_error("rea::buildAbaqusTree: METIS_NodeND 失败");
     std::vector<int64_t> permND(static_cast<size_t>(n));
-    for (int64_t v = 0; v < n; ++v)
-        permND[static_cast<size_t>(v)] = mperm[static_cast<size_t>(v)];
+    if (dp > 1) {
+        for (int64_t pos = 0; pos < nv; ++pos)
+            for (int64_t d = 0; d < dp; ++d)
+                permND[static_cast<size_t>(dp * pos + d)] =
+                    dp * static_cast<int64_t>(mperm[static_cast<size_t>(pos)]) + d;
+    } else {
+        for (int64_t v = 0; v < n; ++v)
+            permND[static_cast<size_t>(v)] = mperm[static_cast<size_t>(v)];
+    }
 
     // ---- 2. 符号分析（BuildTreeAfterMetis ↣ etree + columnCount）----
-    if (std::getenv("AMLS_DUMP_TREE"))
-        std::fprintf(stderr, "[rea-tree] step2 analyze\n");
-    sym::SymbolicAnalysis sa = sym::analyzeSymmetrized(A, permND);
+    // dp>1 时在网格节点层做符号分析：A_n = Rᵀ A R（dp×dp dof 块求和；
+    // R 为节点→dof 聚合，A SPD ⇒ A_n SPD）。exact 超节点以节点为原子，
+    // 块大小均为 dp 的倍数——与 Abaqus stf 分布（cant_20:
+    // 3:6739/6:1033/9:70/12:48/18:5/24:3，全为 3 的倍数）一致。若在 dof
+    // 层做消除分析，导出 mtx 丢失的组内耦合会让三重奏被 exact 检测拆开。
+    sym::SymbolicAnalysis sa;
+    if (dp > 1) {
+        std::vector<Eigen::Triplet<double>> trips;
+        trips.reserve(static_cast<size_t>(A.nonZeros()));
+        for (int64_t c = 0; c < n; ++c)
+            for (DefaultTraits::SparseMatrix::InnerIterator it(A, c); it; ++it)
+                trips.emplace_back(it.row() / dp, c / dp, it.value());
+        DefaultTraits::SparseMatrix An(nv, nv);
+        An.setFromTriplets(trips.begin(), trips.end());
+        std::vector<int64_t> nodePerm(static_cast<size_t>(nv));
+        for (int64_t v = 0; v < nv; ++v)
+            nodePerm[static_cast<size_t>(v)] = mperm[static_cast<size_t>(v)];
+        if (std::getenv("AMLS_DUMP_TREE"))
+            std::fprintf(stderr,
+                         "[rea-tree] step2 analyze (node level, nv=%lld)\n",
+                         (long long)nv);
+        sa = sym::analyzeSymmetrized(An, nodePerm);
+    } else {
+        if (std::getenv("AMLS_DUMP_TREE"))
+            std::fprintf(stderr, "[rea-tree] step2 analyze\n");
+        sa = sym::analyzeSymmetrized(A, permND);
+    }
     if (std::getenv("AMLS_DUMP_TREE"))
         std::fprintf(stderr, "[rea-tree] step2 done etree size=%lld\n",
                      (long long)sa.parentColumn.size());
@@ -103,7 +206,23 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
     // ---- 3. exact 基础超节点（CreateFundamentalSuperNodes ↣ buildBlockForest）----
     if (std::getenv("AMLS_DUMP_TREE"))
         std::fprintf(stderr, "[rea-tree] step3 base blocks\n");
-    sym::BlockForest base = sym::buildBlockForest(sa, opt.maxBlockDofs);
+    // dp>1: 块上限按节点数换算（maxBlockDofs 为 dof 单位）
+    sym::BlockForest base = sym::buildBlockForest(
+        sa, dp > 1 ? std::max<int64_t>(1, opt.maxBlockDofs / dp)
+                   : opt.maxBlockDofs);
+    if (dp > 1) {
+        // 节点块 [b,e) → dof 块 [dp*b, dp*e)（节点排列展开后连续）；
+        // blockOfColumn 同步重建为 dof 层（聚合 Pass 以它取 nTotal）。
+        for (auto& blk : base.blocks) {
+            blk.begin *= dp;
+            blk.end *= dp;
+        }
+        base.blockOfColumn.assign(static_cast<size_t>(n), -1);
+        for (int64_t b = 0; b < static_cast<int64_t>(base.blocks.size()); ++b)
+            for (int64_t j = base.blocks[static_cast<size_t>(b)].begin;
+                 j < base.blocks[static_cast<size_t>(b)].end; ++j)
+                base.blockOfColumn[static_cast<size_t>(j)] = b;
+    }
     if (std::getenv("AMLS_DUMP_TREE")) {
         std::fprintf(stderr, "[rea-tree] step3 done base blocks=%lld\n",
                      (long long)base.blocks.size());

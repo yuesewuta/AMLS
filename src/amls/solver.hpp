@@ -36,6 +36,7 @@ struct AmlsOptions {
     int64_t reaMaxBlockDofs = 4096;   // 块 DOF 上限（ABA_PAMS_UPPER_CUTOFF=4096）
     int64_t reaCollapseDofs = 120;    // Collapse2 合并上限（LEAF_SN_LIMIT=120）
     int64_t reaLeafAggrDofs = 20;     // AggregateLeaves 上限（LEAF_AGGR_LIMIT=20）
+    int     reaDofsPerNode = 0;   // 网格节点收缩宽度（0=自动 3，1=逐 DOF）
     double  cutoff2 = 0.0;    // 蒸馏阈值倍数（param_8；<=0 = 跟随 gainCoefficient）
     double  cutoff3 = 0.0;    // 初始子空间倍数（param_9；<=0 = 跟随 gainCoefficient）
     double  globalShift = 0.0;  // 全局 shift（ABA_PAMS_GLOBALSHIFT）
