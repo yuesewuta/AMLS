@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -150,6 +151,7 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
             " 布局校验失败（n 不整除或组内 dofs 未两两耦合）");
     }
     const int64_t nv = dp > 1 ? n / dp : n;
+
     Csr g = dp > 1 ? extractNodeGraph(A, dp, nv) : extractGraph(A);
     idx_t nvtxs = static_cast<idx_t>(nv);
     std::vector<idx_t> mperm(static_cast<size_t>(nv)), iperm(static_cast<size_t>(nv));
@@ -174,9 +176,10 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
     // ---- 2. 符号分析（BuildTreeAfterMetis ↣ etree + columnCount）----
     // dp>1 时在网格节点层做符号分析：A_n = Rᵀ A R（dp×dp dof 块求和；
     // R 为节点→dof 聚合，A SPD ⇒ A_n SPD）。exact 超节点以节点为原子，
-    // 块大小均为 dp 的倍数——与 Abaqus stf 分布（cant_20:
-    // 3:6739/6:1033/9:70/12:48/18:5/24:3，全为 3 的倍数）一致。若在 dof
-    // 层做消除分析，导出 mtx 丢失的组内耦合会让三重奏被 exact 检测拆开。
+    // 块大小均为 dp 的倍数——与 Abaqus fca（真因子副本）的精确嵌套块分布
+    // 一致（cant_10: 1308 块 {3:1293, 6:11, 12:4}；cant_20: 9197 块
+    // {3:9143, 6:48, 9:2, 12:4}，合并率 ~1%）。若在 dof 层做消除分析，
+    // 导出 mtx 丢失的组内耦合会让三重奏被 exact 检测拆开。
     sym::SymbolicAnalysis sa;
     if (dp > 1) {
         std::vector<Eigen::Triplet<double>> trips;
@@ -193,15 +196,52 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
             std::fprintf(stderr,
                          "[rea-tree] step2 analyze (node level, nv=%lld)\n",
                          (long long)nv);
-        sa = sym::analyzeSymmetrized(An, nodePerm);
+        sa = sym::analyzeSymmetrized(An, nodePerm, /*wantPatterns=*/true);
     } else {
         if (std::getenv("AMLS_DUMP_TREE"))
             std::fprintf(stderr, "[rea-tree] step2 analyze\n");
-        sa = sym::analyzeSymmetrized(A, permND);
+        sa = sym::analyzeSymmetrized(A, permND, /*wantPatterns=*/true);
     }
     if (std::getenv("AMLS_DUMP_TREE"))
         std::fprintf(stderr, "[rea-tree] step2 done etree size=%lld\n",
                      (long long)sa.parentColumn.size());
+    // 诊断转储：节点层的 etree 父列与 L 列计数（放宽合并判据的原型分析用）
+    if (const char* ncPath = std::getenv("AMLS_DUMP_NODECOLS")) {
+        std::ofstream out(ncPath);
+        for (int64_t j = 0; j < static_cast<int64_t>(sa.parentColumn.size());
+             ++j)
+            out << j << ' ' << sa.parentColumn[static_cast<size_t>(j)] << ' '
+                << sa.columnCount[static_cast<size_t>(j)] << '\n';
+    }
+    // 诊断转储：节点层 K 图（原图，无填充）在排列坐标下的外部邻接。
+    // 行: "j cnt n1 n2 ..."，ni 为 j 的原图邻居中排列位置 > j 的节点。
+    if (const char* kcPath = std::getenv("AMLS_DUMP_KCOLS")) {
+        std::ofstream out(kcPath);
+        // dof 逆排列（sa 在 dp>1 时是节点层的，不能直接用 sa.inversePerm）
+        std::vector<int64_t> invDof(static_cast<size_t>(n));
+        for (int64_t pos = 0; pos < n; ++pos)
+            invDof[static_cast<size_t>(permND[static_cast<size_t>(pos)])] = pos;
+        std::vector<std::vector<int64_t>> knbr(static_cast<size_t>(nv));
+        for (int64_t c = 0; c < n; ++c) {
+            const int64_t pc = invDof[static_cast<size_t>(c)] / dp;
+            for (DefaultTraits::SparseMatrix::InnerIterator it(A, c); it; ++it) {
+                const int64_t pr = invDof[static_cast<size_t>(it.row())] / dp;
+                if (pr == pc) continue;
+                if (pr > pc)
+                    knbr[static_cast<size_t>(pc)].push_back(pr);
+                else
+                    knbr[static_cast<size_t>(pr)].push_back(pc);
+            }
+        }
+        for (int64_t j = 0; j < nv; ++j) {
+            auto& v = knbr[static_cast<size_t>(j)];
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+            out << j << ' ' << v.size();
+            for (const int64_t x : v) out << ' ' << x;
+            out << '\n';
+        }
+    }
 
     // ---- 3. exact 基础超节点（CreateFundamentalSuperNodes ↣ buildBlockForest）----
     if (std::getenv("AMLS_DUMP_TREE"))

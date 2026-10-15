@@ -35,9 +35,14 @@ struct BlockForest {
 
 /// 从符号分析构造受限消去块树。
 /// maxBlockDofs: 每块自身 DOF 上限（硬拆分阈值，设计文档默认 1000）。
+/// maxChainNodes: 单个 exact 块最多合并的连续列（节点）数，≤0 = 不限。
+///   默认 4（Abaqus fca 实测其基础超节点尺寸支撑为 {3,6,9,12} DOF，
+///   dp=3 时即 ≤4 节点）：既复现 Abaqus 的均匀小块分布，又避免因子
+///   填充在规则网格区产生的长等结构链（cant_10 曾出现 363-DOF 巨链）。
 /// 保留单子链（不收缩）、不合并多根（森林）。
 BlockForest buildBlockForest(const SymbolicAnalysis& sa,
-                             int64_t maxBlockDofs = 1000);
+                             int64_t maxBlockDofs = 1000,
+                             int64_t maxChainNodes = 4);
 
 /// 统计: 块数/最大块/叶数/最大深度/单子节点数（诊断）。
 void dumpBlockForestStats(const BlockForest& forest);

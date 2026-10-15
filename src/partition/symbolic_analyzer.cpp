@@ -21,7 +21,8 @@ using Index = DefaultTraits::Index;
 // 输入 A 是原始矩阵，permND 为 METIS 排列（perm[new]=old）。
 // 构造 A_permuted = P A Pᵀ，analyzePattern 后提取 L。
 FactorMeta analyzeWithEigen(const SparseMatrix& A,
-                            const std::vector<int64_t>& permND) {
+                            const std::vector<int64_t>& permND,
+                            bool wantPatterns) {
     const int64_t n = A.rows();
     // 重排: B = P A Pᵀ (P: permND[new]=old)
     std::vector<Index> inv(static_cast<size_t>(n));
@@ -77,13 +78,30 @@ FactorMeta analyzeWithEigen(const SparseMatrix& A,
     if (std::getenv("AMLS_DUMP_TREE"))
         std::fprintf(stderr, "[sym] L nnz=%lld (from numeric factor)\n",
                      (long long)L.nonZeros());
-    return extractFactorMeta(L, n);
+    // 模式源选择（AMLS_SUPERNODE_PATTERN）:
+    //   k（默认）— 排列后输入的下三角（K 图，无填充）。Abaqus 的真实判据
+    //     （fca 精确嵌套标定: cant_10 {3:1293,6:11,12:4} / cant_20
+    //     {3:9143,6:48,9:2,12:4}，合并率 ~1%；cant_20_K 实测 {3:8614,6:97,9:4}）。
+    //     K 嵌套对仍是 etree 链段，块特征值/缩聚与 factor 模式逐位一致
+    //     （cant_20_K 12 模态实测相同）。
+    //   factor — L 的填充列结构。合并块 = 因子嵌套链前缀；规则网格区的
+    //     填充等结构链更长（合并率 ~44% vs K 模式 ~1%），尺寸仍均匀
+    //     （≤链上限）但与 Abaqus 合并模式差异大。仅作 A/B 备选。
+    // 注意: 曾疑似 K 模式导致负特征值——后查明是输入矩阵 STIF2_full 的
+    // 1e36 罚对角在缩聚中的数值灾难（HEAD/factor 模式同样复现），与判据无关。
+    const SparseMatrix* patternSource = &Bl;
+    if (wantPatterns) {
+        const char* pat = std::getenv("AMLS_SUPERNODE_PATTERN");
+        if (pat && std::string_view(pat) == "factor") patternSource = nullptr;
+    }
+    return extractFactorMeta(L, n, wantPatterns, patternSource);
 }
 
 }  // namespace
 
 FactorMeta extractFactorMeta(
-    const Eigen::SparseMatrix<double, Eigen::ColMajor, int64_t>& L, int64_t n) {
+    const Eigen::SparseMatrix<double, Eigen::ColMajor, int64_t>& L, int64_t n,
+    bool wantPatterns, const SparseMatrix* patternSource) {
     FactorMeta meta;
     meta.parentColumn.assign(static_cast<size_t>(n), -1);
     meta.columnCount.assign(static_cast<size_t>(n), 0);
@@ -100,6 +118,28 @@ FactorMeta extractFactorMeta(
             if (r > j && (par < 0 || r < par)) par = r;
         }
         meta.parentColumn[static_cast<size_t>(j)] = par;
+    }
+    if (wantPatterns) {
+        // 双模式（见 analyzeWithEigen 注释）: patternSource 非空（默认 k）
+        // 复制其下三角（K 图）；为空（AMLS_SUPERNODE_PATTERN=factor）复制
+        // L 的填充列结构。两种模式都是列内升序、含自身对角，供
+        // supernode_builder 的 sameSupernodePattern 做嵌套比较。
+        if (patternSource == nullptr) {
+            meta.colPtr.assign(outer, outer + n + 1);
+            meta.colIdx.assign(inner, inner + L.nonZeros());
+        } else {
+            meta.colPtr.assign(static_cast<size_t>(n) + 1, 0);
+            for (int64_t j = 0; j < n; ++j) {
+                const int64_t lo = patternSource->outerIndexPtr()[j],
+                              hi = patternSource->outerIndexPtr()[j + 1];
+                for (int64_t p = lo; p < hi; ++p) {
+                    const int64_t r = patternSource->innerIndexPtr()[p];
+                    if (r >= j) meta.colIdx.push_back(r);
+                }
+                meta.colPtr[static_cast<size_t>(j) + 1] =
+                    static_cast<int64_t>(meta.colIdx.size());
+            }
+        }
     }
     // 连通分量根: 沿 parent 链向上找到顶层列（parent 链末端）。
     // 注意: L 的叶列 parent=-1 是因为无非对角元，但消去树里真正的根是
@@ -135,7 +175,8 @@ FactorMeta extractFactorMeta(
 }
 
 SymbolicAnalysis analyzeSymmetrized(const SparseMatrix& A,
-                                    const std::vector<int64_t>& permND) {
+                                    const std::vector<int64_t>& permND,
+                                    bool wantPatterns) {
     const int64_t n = A.rows();
     if (static_cast<int64_t>(permND.size()) != n)
         throw std::runtime_error("symbolic_analyzer: 排列长度 != n");
@@ -145,10 +186,12 @@ SymbolicAnalysis analyzeSymmetrized(const SparseMatrix& A,
     for (int64_t i = 0; i < n; ++i)
         sa.inversePerm[static_cast<size_t>(permND[static_cast<size_t>(i)])] = i;
 
-    FactorMeta meta = analyzeWithEigen(A, permND);
+    FactorMeta meta = analyzeWithEigen(A, permND, wantPatterns);
     sa.parentColumn = std::move(meta.parentColumn);
     sa.columnCount = std::move(meta.columnCount);
     sa.componentRoots = std::move(meta.componentRoots);
+    sa.colPtr = std::move(meta.colPtr);
+    sa.colIdx = std::move(meta.colIdx);
     return sa;
 }
 
