@@ -47,3 +47,4 @@ docs/abaqus_ams/cant_31_消去树图.png
 trace_*.json
 __pycache__/
 analysis_zero_cols.py
+aams/build/
