@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -269,6 +270,7 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
             throw std::runtime_error("Reduction Phase 失败（详见日志）");
     }
     sol.timing["REDUCTION"] = seconds(t1, Clock::now());
+    colOpsDumpStats();
     if (opt.verbosity > 0)
         std::cout << "[aams] reduction done: substructures=" << nTreeNodes
                   << " threads=" << threads << "（节点池 " << nodeThreads
@@ -280,13 +282,32 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
     DenseMatrix reducedK, reducedM;
     DenseMatrix recoveredVectors;   // 缩聚特征向量（p×m，缩聚坐标）
     constexpr double kTwoPi = 6.283185307179586476925286766559;
-    if (!saver.assembleSubspaceStiffness(reducedK))
-        throw std::runtime_error("子空间刚度组装失败");
-    if (!massSaver.assembleSubspaceMass(saver, reducedM))
-        throw std::runtime_error("子空间质量组装失败");
+    {
+        const auto ta = Clock::now();
+        if (!saver.assembleSubspaceStiffness(reducedK))
+            throw std::runtime_error("子空间刚度组装失败");
+        if (!massSaver.assembleSubspaceMass(saver, reducedM))
+            throw std::runtime_error("子空间质量组装失败");
+        sol.timing["ASSEMBLE_SUBSPACE"] = seconds(ta, Clock::now());
+    }
     sol.reducedSize = reducedK.rows();
-    if (opt.verbosity > 0)
+    if (opt.verbosity > 0) {
         std::cout << "[aams] reduced subspace p=" << sol.reducedSize << "\n";
+        if (std::getenv("AAMS_PROFILE") != nullptr) {
+            const auto names = {"SolveLocalEigenPair", "GaussConstraint",
+                                "GaussKAccum", "GaussMTemp", "GaussMAccum",
+                                "GaussReleaseMtemp", "GaussReleaseReducedDiag",
+                                "CompressLeft", "CompressUpdate",
+                                "CompressRight", "ReleaseTempBlock"};
+            const auto secs = exec.profileTaskSeconds();
+            const auto cnts = exec.profileTaskCounts();
+            std::cerr << "[prof] reduction tasks (sum seconds | count):\n";
+            std::size_t i = 0;
+            for (const char* nm : names)
+                std::cerr << "  " << nm << " = " << secs[i] << "s | "
+                          << cnts[i++] << "\n";
+        }
+    }
 
     // 频段：[fmin,fmax]（Sturm 检查与特征值表的区间上界 = fmax [R]）。
     const double bandLo =
@@ -294,14 +315,16 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
     const double bandHi = kTwoPi * kTwoPi * par.fmaxHz * par.fmaxHz;
     if (opt.reducedMethod == "distill") {
         rea::DistillParams dp;
+        const auto td = Clock::now();
         dp.fmaxHz = par.fmaxHz;
         dp.fminHz = par.fminHz;
         dp.cutoff2 = par.cutoff2;
         dp.cutoff3 = par.cutoff3;
         dp.shift = par.globalShift;
         dp.subspaceIteration = opt.subspaceIteration;
-    dp.subspaceMax = par.subspaceMax;
+        dp.subspaceMax = par.subspaceMax;
         dp.extractOrder = par.nev;
+        dp.blasThreads = threads;
         rea::DistillResult dr = rea::distillRitz(reducedK, reducedM, dp);
         reducedK.resize(0, 0);
         reducedM.resize(0, 0);
@@ -309,6 +332,7 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
             throw std::runtime_error("关注频段内无模态（检查 fmin/fmax）");
         sol.eigenvalues = std::move(dr.eigenvalues);
         recoveredVectors = std::move(dr.eigenvectors);
+        sol.timing["DISTILL"] = seconds(td, Clock::now());
         if (opt.verbosity > 0)
             std::cout << "[aams] distillation: p=" << dr.inputSize
                       << " -> p'=" << dr.distilledSize

@@ -34,4 +34,14 @@ void dsytrs_(const char* uplo, const int32_t* n, const int32_t* nrhs,
              const double* a, const int32_t* lda, const int32_t* ipiv,
              double* b, const int32_t* ldb, int32_t* info);
 
+
+// 对称正定分解（Cholesky）：A = L·Lᵀ（uplo='L' 只读下三角）。
+void dpotrf_(const char* uplo, const int32_t* n, double* a,
+             const int32_t* lda, int32_t* info);
+
+// 用 dpotrf 的因子做多右端回代求解 A·X = B（B 原地覆盖）。
+void dpotrs_(const char* uplo, const int32_t* n, const int32_t* nrhs,
+             const double* a, const int32_t* lda, double* b,
+             const int32_t* ldb, int32_t* info);
+
 } // extern "C"

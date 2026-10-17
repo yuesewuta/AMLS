@@ -3,6 +3,7 @@
 // —— 移植自 third_party/amlsPKU utils/col_ops，GEMM 底层走宿主 cblas
 // （大乘法经 dgemmColsRaw 借线程），回代走 netlib LAPACK dsytrf/dsytrs。
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "core/types.hpp"
@@ -47,6 +48,33 @@ bool opsColAccGemv(const ColCompMat& B, bool transB, const ColCompMat& C,
 /// 显式乘积，再按列映射散加到 A。
 bool opsColAccGemm(const ColCompMat& B, bool transB, const ColCompMat& C,
                    ColCompMat& A);
+
+/// 批量非转置累加：targets[i] += L · psis[i]（i = 0..psis.size()-1）。
+///
+/// CompressUpdate 专用：固定左块 L 与节点，向全部祖先目标块更新。
+/// 把各 Ψ 的有效列拼接成一次 dgemm（乘积 Y 按列分组），再逐目标持锁
+/// 散加——调用开销与锁持有时间从 O(|anc|) 次乘法降为 1 次乘法 + 散加。
+/// 各 Ψ 行数须等于 L.totalCols（与逐对 opsColAcc 契约一致）；
+/// L / Ψ 的 0 有效列按恒零贡献跳过，对应目标仍需调用方倒计数。
+/// mtxs[i] 为散加 targets[i] 时持有的锁（可为 nullptr 表示无锁）。
+bool opsColAccBatch(const ColCompMat& L,
+                    const std::vector<const ColCompMat*>& psis,
+                    const std::vector<ColCompMat*>& targets,
+                    const std::vector<std::mutex*>& mtxs);
+
+/// 批量转置累加：targets[i] += Bᵀ · Cs[i]（i = 0..Cs.size()-1）。
+///
+/// GaussKAccum / GaussMAccum 专用：固定 B（Ψ_j 或 M_temp_j），向全部
+/// k 目标块更新。各 C 有效列拼成一次 dgemm（prod = Bᵀ·C_all），再逐
+/// 目标持锁按 B 有效行散射。B 占位列的乘积行被丢弃（与逐对 gemv 的
+/// 语义一致——占位贡献恒 0）。mtx 为 nullptr 表示无锁。
+bool opsColAccBatchTrans(const ColCompMat& B,
+                         const std::vector<const ColCompMat*>& Cs,
+                         const std::vector<ColCompMat*>& targets,
+                         const std::vector<std::mutex*>& mtxs);
+
+/// 输出 opsColAcc gemv/gemm 剖析计数（AAMS_PROFILE=1 时生效）。
+void colOpsDumpStats();
 
 /// 按配置分发到 opsColAccGemv / opsColAccGemm（useGemv 对应
 /// AmlsInternalParam::useColAccgemv）。

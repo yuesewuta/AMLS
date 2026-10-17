@@ -231,6 +231,51 @@ bool TempBlockManager::updateColComp_(int64_t nodeID) {
 
     for (size_t d = 0; d < descendants.size(); ++d) {
         BlockState* left = leftStates[d];
+        if (left->value.rows() == 0) {
+            // 0 模态链路：目标块须同为 0 行零块，仅倒计数
+            for (size_t a = 0; a < ancestors.size(); ++a) {
+                BlockState* target =
+                    findBlock_(Key{descendants[d], ancestors[a]});
+                if (target == nullptr) {
+                    AMLS_LOG_ERROR("update({}) 失败：目标块 ({},{}) 缺失。", nodeID,
+                                   descendants[d], ancestors[a]);
+                    return false;
+                }
+                std::lock_guard<std::mutex> lock(target->mtx);
+                if (target->lifecycle.load(std::memory_order_relaxed) !=
+                    Lifecycle::Active) {
+                    AMLS_LOG_ERROR(
+                        "update({}) 失败：目标块 ({},{}) 未激活。", nodeID,
+                        descendants[d], ancestors[a]);
+                    return false;
+                }
+                if (target->remainingUpdates.load(std::memory_order_relaxed) <= 0) {
+                    AMLS_LOG_ERROR(
+                        "update({}) 失败：目标块 ({},{}) 剩余更新 {} 非正。", nodeID,
+                        descendants[d], ancestors[a],
+                        target->remainingUpdates.load(std::memory_order_relaxed));
+                    return false;
+                }
+                if (!target->value.numericReady() ||
+                    target->value.rows() != 0) {
+                    AMLS_LOG_ERROR(
+                        "update({}) 失败：0 模态目标块 ({},{}) 不一致。", nodeID,
+                        descendants[d], ancestors[a]);
+                    return false;
+                }
+                target->remainingUpdates.fetch_sub(1, std::memory_order_release);
+            }
+            continue;
+        }
+        // 数值路径：固定 (node, d)，全部祖先的 Ψ 拼成一次 dgemm
+        // （乘积按列分组），再逐目标持锁散加——4.58M 次小乘法调用的
+        // 开销按祖先数摊薄。
+        std::vector<const ColCompMat*> psiList;
+        std::vector<ColCompMat*> targetList;
+        std::vector<std::mutex*> mtxList;
+        psiList.reserve(ancestors.size());
+        targetList.reserve(ancestors.size());
+        mtxList.reserve(ancestors.size());
         for (size_t a = 0; a < ancestors.size(); ++a) {
             BlockState* target =
                 findBlock_(Key{descendants[d], ancestors[a]});
@@ -239,7 +284,6 @@ bool TempBlockManager::updateColComp_(int64_t nodeID) {
                                descendants[d], ancestors[a]);
                 return false;
             }
-            std::lock_guard<std::mutex> lock(target->mtx);
             if (target->lifecycle.load(std::memory_order_relaxed) !=
                 Lifecycle::Active) {
                 AMLS_LOG_ERROR(
@@ -254,28 +298,22 @@ bool TempBlockManager::updateColComp_(int64_t nodeID) {
                     target->remainingUpdates.load(std::memory_order_relaxed));
                 return false;
             }
-            if (left->value.rows() == 0) {
-                // 0 模态链路：目标块须同为 0 行零块，仅倒计数
-                if (!target->value.numericReady() ||
-                    target->value.rows() != 0) {
-                    AMLS_LOG_ERROR(
-                        "update({}) 失败：0 模态目标块 ({},{}) 不一致。", nodeID,
-                        descendants[d], ancestors[a]);
-                    return false;
-                }
-            } else {
-                // 列规划保证目标存储列覆盖 Ψ 有效列（覆盖性检查即预留定理
-                // 的运行时断言）
-                if (!opsColAcc(useGemv_, left->value, false, *psis[a],
-                               target->value)) {
-                    AMLS_LOG_ERROR(
-                        "update({}) 失败：μ ({},{}) += μ ({},{})·Ψ ({},{}) 维度"
-                        "不匹配。",
-                        nodeID, descendants[d], ancestors[a], descendants[d],
-                        nodeID, nodeID, ancestors[a]);
-                    return false;
-                }
-            }
+            psiList.push_back(psis[a]);
+            targetList.push_back(&target->value);
+            mtxList.push_back(&target->mtx);
+        }
+        // 列规划保证目标存储列覆盖 Ψ 有效列（覆盖性检查即预留定理
+        // 的运行时断言）
+        if (!opsColAccBatch(left->value, psiList, targetList, mtxList)) {
+            AMLS_LOG_ERROR(
+                "update({}) 失败：μ ({},{}) += μ ({},{})·Ψ 批量更新维度不匹配"
+                "或覆盖缺失。",
+                nodeID, descendants[d], nodeID, descendants[d], nodeID);
+            return false;
+        }
+        for (size_t a = 0; a < ancestors.size(); ++a) {
+            BlockState* target =
+                findBlock_(Key{descendants[d], ancestors[a]});
             target->remainingUpdates.fetch_sub(1, std::memory_order_release);
         }
     }

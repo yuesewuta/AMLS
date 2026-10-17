@@ -33,6 +33,7 @@ struct DistillParams {
     bool subspaceIteration = true;   // 一次子空间迭代（Abaqus 默认开）
     int64_t subspaceMax = 3000;      // 迭代子空间规模上限（pme_SolverParameters[0xa0]）
     int64_t extractOrder = 0;        // 额外数截断（对齐 PKU extractOrder，0 = 不限）
+    int blasThreads = 1;             // 本阶段 OpenBLAS 线程数（>1 时临时放开）
 };
 
 struct DistillResult {

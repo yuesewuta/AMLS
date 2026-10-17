@@ -223,6 +223,10 @@ public:
         if (eigenCfg.dense == nullptr || eigenCfg.blocks == nullptr)
             throw std::invalid_argument(
                 "NodeTaskExecutor 需要 dense 求解器与 OriginalBlocks");
+        taskNanos_ = std::vector<std::atomic<std::uint64_t>>(
+            static_cast<std::size_t>(NodeTaskKind::Count));
+        taskCounts_ = std::vector<std::atomic<std::int64_t>>(
+            static_cast<std::size_t>(NodeTaskKind::Count));
     }
 
     /// 节点序执行全部节点（叶子先入队、父节点级联）；失败返回 false
@@ -232,6 +236,11 @@ public:
     int64_t completedNodes() const {
         return completedNodes_.load(std::memory_order_relaxed);
     }
+
+    /// 性能剖析（AAMS_PROFILE=1）：11 类 DAG 任务的累计执行时间（秒）
+    /// 与调用次数，下标即 NodeTaskKind。
+    std::vector<double> profileTaskSeconds() const;
+    std::vector<int64_t> profileTaskCounts() const;
 
 private:
     // 11 任务入口（幂等；失败经 states_.firstFailure 短路）。
@@ -258,6 +267,8 @@ private:
     NodeTaskStateStore& states_;
     LocalEigenConfig cfg_;
     std::atomic<int64_t> completedNodes_{0};
+    std::vector<std::atomic<std::uint64_t>> taskNanos_;
+    std::vector<std::atomic<std::int64_t>> taskCounts_;
 };
 
 } // namespace aams

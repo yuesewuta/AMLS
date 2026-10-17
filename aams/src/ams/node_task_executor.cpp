@@ -1,5 +1,6 @@
 #include "ams/node_task_executor.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <cstdio>
@@ -345,6 +346,7 @@ void NodeTaskExecutor::execDagTask(const std::shared_ptr<void>& ctxVoid,
     static_assert(sizeof(kRunners) / sizeof(kRunners[0]) == kDagTaskCount);
 
     bool ok = false;
+    const auto tStart = std::chrono::steady_clock::now();
     try {
         ok = (this->*kRunners[taskIdx])(dag->nodeID);
     } catch (const std::exception& e) {
@@ -352,6 +354,13 @@ void NodeTaskExecutor::execDagTask(const std::shared_ptr<void>& ctxVoid,
                        e.what());
         ok = false;
     }
+    taskNanos_[taskIdx].fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tStart)
+                .count()),
+        std::memory_order_relaxed);
+    taskCounts_[taskIdx].fetch_add(1, std::memory_order_relaxed);
     if (!ok) dag->failure.store(1, std::memory_order_release);
 
     // 成功才级联后继；先增 inFlight 再入队，保证等待谓词不丢唤醒。
@@ -492,6 +501,21 @@ bool NodeTaskExecutor::runNodeOrder(ThreadPool& nodePool,
     if (!temp_.release(tree_.root()))
         AMLS_LOG_WARN("根节点临时块释放异常（可能已释放）。");
     return true;
+}
+
+std::vector<double> NodeTaskExecutor::profileTaskSeconds() const {
+    std::vector<double> out(taskNanos_.size(), 0.0);
+    for (std::size_t i = 0; i < taskNanos_.size(); ++i)
+        out[i] = static_cast<double>(
+                     taskNanos_[i].load(std::memory_order_relaxed)) * 1e-9;
+    return out;
+}
+
+std::vector<int64_t> NodeTaskExecutor::profileTaskCounts() const {
+    std::vector<int64_t> out(taskCounts_.size(), 0);
+    for (std::size_t i = 0; i < taskCounts_.size(); ++i)
+        out[i] = taskCounts_[i].load(std::memory_order_relaxed);
+    return out;
 }
 
 } // namespace aams

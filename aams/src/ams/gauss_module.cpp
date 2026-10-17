@@ -264,6 +264,14 @@ bool GaussEliminationModule::accumulateReducedStiffness(int64_t nodeI) {
                 nodeI, j);
             return false;
         }
+        // 固定 (nodeI, j)：全部 k≥j 的 K̃(nodeI,k) 拼成一次转置 dgemm，
+        // 乘积再逐目标持锁散射——|anc|² 次小乘法摊成 |anc| 次批量。
+        std::vector<const ColCompMat*> sources;
+        std::vector<ColCompMat*> targets;
+        std::vector<std::mutex*> mtxs;
+        sources.reserve(anc.size());
+        targets.reserve(anc.size());
+        mtxs.reserve(anc.size());
         for (int64_t k : anc) {
             if (k < j) continue;  // 目标 (j,k)：j ≤ k，k ∈ A_j ∪ {j}
             ColCompMat* source = nullptr;
@@ -284,16 +292,22 @@ bool GaussEliminationModule::accumulateReducedStiffness(int64_t nodeI) {
                                j, k);
                 return false;
             }
-            std::lock_guard<std::mutex> targetLock(targetEntry->mtx);
-            ColCompMat* target = nullptr;
-            if (!ensureReduced_(true, j, k, *targetEntry, target)) return false;
-            if (!opsColAcc(useGemv_, *psi, true, *source, *target)) {
-                AMLS_LOG_ERROR(
-                    "accumulateReducedStiffness 失败：K̃ ({},{}) += Ψ ({},{})ᵀ·"
-                    "K̃ ({},{}) 维度不匹配。",
-                    j, k, nodeI, j, nodeI, k);
-                return false;
+            {
+                std::lock_guard<std::mutex> lock(targetEntry->mtx);
+                ColCompMat* target = nullptr;
+                if (!ensureReduced_(true, j, k, *targetEntry, target))
+                    return false;
+                targets.push_back(target);
             }
+            sources.push_back(source);
+            mtxs.push_back(&targetEntry->mtx);
+        }
+        if (!opsColAccBatchTrans(*psi, sources, targets, mtxs)) {
+            AMLS_LOG_ERROR(
+                "accumulateReducedStiffness 失败：K̃ (j,{}) += Ψ ({},{})ᵀ·"
+                "K̃ ({},{},·) 批量更新维度不匹配。",
+                j, nodeI, j, nodeI);
+            return false;
         }
     }
     return true;
@@ -360,6 +374,15 @@ bool GaussEliminationModule::accumulateReducedMass(int64_t nodeI) {
                 nodeI, j);
             return false;
         }
+        // 固定 (nodeI, j)：两项共享 B 的转置累加各拼一次 dgemm，
+        // 项1 B=Ψ_j × C=M̃(nodeI,·)，项2 B=M_temp_j × C=Ψ(nodeI,·)。
+        std::vector<const ColCompMat*> src1, src2;
+        std::vector<ColCompMat*> targets;
+        std::vector<std::mutex*> mtxs;
+        src1.reserve(anc.size());
+        src2.reserve(anc.size());
+        targets.reserve(anc.size());
+        mtxs.reserve(anc.size());
         for (int64_t k : anc) {
             if (k < j) continue;
             const auto* psiK = getPsi(nodeI, k);
@@ -386,17 +409,24 @@ bool GaussEliminationModule::accumulateReducedMass(int64_t nodeI) {
                     "accumulateReducedMass 失败：M 目标块 ({},{}) 槽位缺失。", j, k);
                 return false;
             }
-            std::lock_guard<std::mutex> targetLock(targetEntry->mtx);
-            ColCompMat* target = nullptr;
-            if (!ensureReduced_(false, j, k, *targetEntry, target)) return false;
-            if (!opsColAcc(useGemv_, *psiJ, true, *source, *target) ||
-                !opsColAcc(useGemv_, *mtemp, true, *psiK, *target)) {
-                AMLS_LOG_ERROR(
-                    "accumulateReducedMass 失败：M̃ ({},{}) += Ψ ({},{})ᵀ·M̃ "
-                    "({},{}) + M_temp ({},{})ᵀ·Ψ ({},{}) 维度不匹配。",
-                    j, k, nodeI, j, nodeI, k, nodeI, j, nodeI, k);
-                return false;
+            {
+                std::lock_guard<std::mutex> lock(targetEntry->mtx);
+                ColCompMat* target = nullptr;
+                if (!ensureReduced_(false, j, k, *targetEntry, target))
+                    return false;
+                targets.push_back(target);
             }
+            src1.push_back(source);
+            src2.push_back(psiK);
+            mtxs.push_back(&targetEntry->mtx);
+        }
+        if (!opsColAccBatchTrans(*psiJ, src1, targets, mtxs) ||
+            !opsColAccBatchTrans(*mtemp, src2, targets, mtxs)) {
+            AMLS_LOG_ERROR(
+                "accumulateReducedMass 失败：M̃ (j,·) += Ψ ({},{})ᵀ·M̃ + "
+                "M_temp ({},{})ᵀ·Ψ 批量更新维度不匹配。",
+                nodeI, j, nodeI, j);
+            return false;
         }
     }
     return true;
