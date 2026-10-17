@@ -89,6 +89,29 @@ bool opsColAccBatchTrans(const ColCompMat& B,
                          const std::vector<ColCompMat*>& targets,
                          const std::vector<std::mutex*>& mtxs);
 
+/// 共享右端（转置批量累加的后缀复用）：各 Cs 有效列拼接一次，
+/// 之后多个 B（不同 j）各自乘其后缀视图，免每 (j,k) 重建 C_all。
+/// 索引约定：段 i ↔ Cs[i] ↔ targets[i]，列区间 [segBeg[i], segBeg[i+1])。
+struct TransRightEnd {
+    std::vector<double> c;        // rows × nAll（列主序拼接）
+    std::vector<int64_t> orig;    // 每全局列的原始列号
+    std::vector<int64_t> segBeg;  // 长度 cs.size()+1，末元 = nAll
+};
+
+/// 构建共享右端：rows 为各 Cs 行数（须一致）。
+bool opsTransBuildRightEnd(int64_t rows,
+                           const std::vector<const ColCompMat*>& cs,
+                           TransRightEnd& re);
+
+/// 后缀视图批量转置累加：targets[t] += Bᵀ · re.c[:, segBeg[segBegIdx+t]]
+/// （t = 0..targets.size()-1，即段 segBegIdx 起的连续后缀）。语义与
+/// opsColAccBatchTrans 完全一致（B 占位行乘积丢弃、逐目标持锁散加），
+/// 仅右端改由调用方预构建共享。mtx 为 nullptr 表示无锁。
+bool opsColAccBatchTransSuffix(const ColCompMat& B, const TransRightEnd& re,
+                               int64_t segBegIdx,
+                               const std::vector<ColCompMat*>& targets,
+                               const std::vector<std::mutex*>& mtxs);
+
 /// 输出 opsColAcc gemv/gemm 剖析计数（AAMS_PROFILE=1 时生效）。
 void colOpsDumpStats();
 

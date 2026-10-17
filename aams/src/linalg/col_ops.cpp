@@ -36,6 +36,9 @@ struct OpAccStats {
     // 批量累加分段计时（opsColAccBatch / opsColAccBatchTrans）
     std::atomic<uint64_t> batchCalls{0};
     std::atomic<uint64_t> batchGatherNs{0}, batchGemmNs{0}, batchScatterNs{0};
+    // trans 路径（MAccum/KAccum）单独分段：与堆叠路径区分归因
+    std::atomic<uint64_t> transCalls{0};
+    std::atomic<uint64_t> transGatherNs{0}, transGemmNs{0}, transScatterNs{0};
 };
 OpAccStats& opAccStats() {
     static OpAccStats s;
@@ -82,6 +85,12 @@ void colOpsDumpStats() {
                  static_cast<double>(st.batchGatherNs.load(std::memory_order_relaxed)) * 1e-9,
                  static_cast<double>(st.batchGemmNs.load(std::memory_order_relaxed)) * 1e-9,
                  static_cast<double>(st.batchScatterNs.load(std::memory_order_relaxed)) * 1e-9);
+    std::fprintf(stderr,
+                 "[prof] colAcc trans: calls=%llu gather=%.3fs gemm=%.3fs scatter=%.3fs\n",
+                 (unsigned long long)st.transCalls.load(std::memory_order_relaxed),
+                 static_cast<double>(st.transGatherNs.load(std::memory_order_relaxed)) * 1e-9,
+                 static_cast<double>(st.transGemmNs.load(std::memory_order_relaxed)) * 1e-9,
+                 static_cast<double>(st.transScatterNs.load(std::memory_order_relaxed)) * 1e-9);
 }
 
 int32_t sytrfFactor(DefaultTraits::DenseMatrix& a,
@@ -923,6 +932,140 @@ bool opsColAccBatchTrans(const ColCompMat& B,
         bs.batchGatherNs.fetch_add(ns(tb0, tb1), std::memory_order_relaxed);
         bs.batchGemmNs.fetch_add(ns(tb1, tb2), std::memory_order_relaxed);
         bs.batchScatterNs.fetch_add(ns(tb2, tb3), std::memory_order_relaxed);
+        bs.transCalls.fetch_add(1, std::memory_order_relaxed);
+        bs.transGatherNs.fetch_add(ns(tb0, tb1), std::memory_order_relaxed);
+        bs.transGemmNs.fetch_add(ns(tb1, tb2), std::memory_order_relaxed);
+        bs.transScatterNs.fetch_add(ns(tb2, tb3), std::memory_order_relaxed);
+    }
+    return true;
+}
+
+bool opsTransBuildRightEnd(int64_t rows,
+                           const std::vector<const ColCompMat*>& cs,
+                           TransRightEnd& re) {
+    constexpr const char* kWho = "opsTransBuildRightEnd";
+    re.c.clear();
+    re.orig.clear();
+    re.segBeg.assign(cs.size() + 1, 0);
+    int64_t nAll = 0;
+    for (size_t i = 0; i < cs.size(); ++i) {
+        if (cs[i]->rows() != rows) {
+            AMLS_LOG_ERROR("[colops] {} 失败：C 行数 {} ≠ {}。", kWho,
+                           cs[i]->rows(), rows);
+            return false;
+        }
+        nAll += cs[i]->activeCols();
+        re.segBeg[i + 1] = nAll;
+    }
+    if (nAll == 0) return true;
+    re.c.resize(static_cast<size_t>(rows * nAll));
+    re.orig.reserve(static_cast<size_t>(nAll));
+    double* cd = re.c.data();
+    for (const ColCompMat* c : cs) {
+        for (int64_t sc = 0; sc < c->validCols(); ++sc) {
+            if (!c->colActive(sc)) continue;
+            re.orig.push_back(c->origColAt(sc));
+            std::memcpy(cd, c->dense().col(sc).data(),
+                        static_cast<size_t>(rows) * sizeof(double));
+            cd += rows;
+        }
+    }
+    return true;
+}
+
+bool opsColAccBatchTransSuffix(const ColCompMat& B, const TransRightEnd& re,
+                               int64_t segBegIdx,
+                               const std::vector<ColCompMat*>& targets,
+                               const std::vector<std::mutex*>& mtxs) {
+    constexpr const char* kWho = "opsColAccBatchTransSuffix";
+    const int64_t nSeg = static_cast<int64_t>(re.segBeg.size()) - 1;
+    if (segBegIdx < 0 || segBegIdx > nSeg ||
+        targets.size() != mtxs.size() ||
+        static_cast<int64_t>(targets.size()) != nSeg - segBegIdx) {
+        AMLS_LOG_ERROR("[colops] {} 失败：段区间/目标数不一致 (segBegIdx={}, "
+                       "nSeg={}, targets={})。",
+                       kWho, segBegIdx, nSeg, targets.size());
+        return false;
+    }
+    if (B.activeCols() == 0) return true;
+    const int64_t colBeg = re.segBeg[static_cast<size_t>(segBegIdx)];
+    const int64_t nAll = re.segBeg[static_cast<size_t>(nSeg)];
+    const int64_t ncols = nAll - colBeg;
+    if (ncols == 0) return true;
+    if (!colCompShapeOk(kWho, "B", B)) return false;
+
+    // B 的有效行（存储列号 + 原始列号）预提取，散射循环零判断
+    static thread_local std::vector<int64_t> tlActSb, tlActOrig;
+    tlActSb.clear();
+    tlActOrig.clear();
+    for (int64_t sb = 0; sb < B.validCols(); ++sb) {
+        if (!B.colActive(sb)) continue;
+        tlActSb.push_back(sb);
+        tlActOrig.push_back(B.origColAt(sb));
+    }
+    if (tlActSb.empty()) return true;
+
+    static thread_local std::vector<double> tlProd;
+    tlProd.resize(static_cast<size_t>(B.validCols() * ncols));
+    const auto tt0 = opAccEnabled() ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+    dgemmColsRaw(CblasTrans, static_cast<int>(B.validCols()),
+                 static_cast<int>(ncols), static_cast<int>(B.rows()), 1.0,
+                 B.dense().data(), static_cast<int>(B.rows()),
+                 re.c.data() + colBeg * B.rows(), static_cast<int>(B.rows()),
+                 0.0, tlProd.data(), static_cast<int>(B.validCols()),
+                 opsTlsThreads());
+    const auto tt1 = opAccEnabled() ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+
+    // 逐目标持锁散射各自列段：dst[B.origColAt(sb)] += prod(sb, g)
+    static thread_local std::vector<int64_t> tlScol;
+    const double* pc = tlProd.data();
+    for (int64_t seg = segBegIdx; seg < nSeg; ++seg) {
+        ColCompMat& A = *targets[static_cast<size_t>(seg - segBegIdx)];
+        std::mutex* m = mtxs[static_cast<size_t>(seg - segBegIdx)];
+        const int64_t b = re.segBeg[static_cast<size_t>(seg)];
+        const int64_t e = re.segBeg[static_cast<size_t>(seg + 1)];
+        if (b == e) continue;
+        // 覆盖性预检放锁外（只读），存储列号缓存供散加与激活复用
+        tlScol.resize(static_cast<size_t>(e - b));
+        for (int64_t g = b; g < e; ++g) {
+            const int64_t sc =
+                A.storageCol(re.orig[static_cast<size_t>(g)]);
+            if (sc < 0) {
+                AMLS_LOG_ERROR(
+                    "[colops] {} 失败：目标存储列未覆盖源有效列（原始列 {}）。",
+                    kWho, re.orig[static_cast<size_t>(g)]);
+                return false;
+            }
+            tlScol[static_cast<size_t>(g - b)] = sc;
+        }
+        std::unique_lock<std::mutex> lock;
+        if (m) lock = std::unique_lock<std::mutex>(*m);
+        for (int64_t g = b; g < e; ++g) {
+            const int64_t scA = tlScol[static_cast<size_t>(g - b)];
+            double* __restrict dst = A.dense().col(scA).data();
+            for (size_t t = 0; t < tlActSb.size(); ++t)
+                dst[tlActOrig[t]] += pc[tlActSb[t]];
+            A.activateStorageCol(scA);
+            pc += B.validCols();
+        }
+    }
+    if (opAccEnabled()) {
+        const auto tt2 = std::chrono::steady_clock::now();
+        auto& bs = opAccStats();
+        const auto ns = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
+        };
+        bs.batchCalls.fetch_add(1, std::memory_order_relaxed);
+        bs.batchGemmNs.fetch_add(ns(tt0, tt1), std::memory_order_relaxed);
+        bs.batchScatterNs.fetch_add(ns(tt1, tt2), std::memory_order_relaxed);
+        bs.transCalls.fetch_add(1, std::memory_order_relaxed);
+        bs.transGatherNs.fetch_add(0, std::memory_order_relaxed);
+        bs.transGemmNs.fetch_add(ns(tt0, tt1), std::memory_order_relaxed);
+        bs.transScatterNs.fetch_add(ns(tt1, tt2), std::memory_order_relaxed);
     }
     return true;
 }

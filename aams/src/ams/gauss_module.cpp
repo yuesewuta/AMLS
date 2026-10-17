@@ -268,26 +268,56 @@ bool GaussEliminationModule::accumulateReducedStiffness(int64_t nodeI) {
                 nodeI, j);
             return false;
         }
-        // 固定 (nodeI, j)：全部 k≥j 的 K̃(nodeI,k) 拼成一次转置 dgemm，
-        // 乘积再逐目标持锁散射——|anc|² 次小乘法摊成 |anc| 次批量。
+    }
+    static const bool noSuffix =
+        std::getenv("AAMS_NO_TRANS_SUFFIX") != nullptr;
+    // 共享右端：全部 k ∈ anc 的 K̃(nodeI,k) 有效列只拼一次；anc 升序，
+    // j = anc[m] 的目标 k≥j 恰为段后缀 [m, nSeg)。|anc|² 次小乘法摊成
+    // |anc| 次 + 一遍 gather。
+    TransRightEnd re;
+    if (!noSuffix) {
         std::vector<const ColCompMat*> sources;
+        sources.reserve(anc.size());
+        for (int64_t k : anc) {
+            ColCompMat* source = nullptr;
+            Entry* entry = slot_(reducedKey_(true, nodeI, k));
+            if (!entry) {
+                AMLS_LOG_ERROR(
+                    "accumulateReducedStiffness 失败：K 源块 ({},{}) 槽位缺失。",
+                    nodeI, k);
+                return false;
+            }
+            if (!ensureReduced_(true, nodeI, k, *entry, source)) return false;
+            sources.push_back(source);
+        }
+        if (!sources.empty() &&
+            !opsTransBuildRightEnd(sources.front()->rows(), sources, re))
+            return false;
+    }
+    for (size_t m = 0; m < anc.size(); ++m) {
+        const int64_t j = anc[m];
+        const auto* psi = getPsi(nodeI, j);
+        // 固定 (nodeI, j)：全部 k≥j 的目标块一次批量更新。
+        std::vector<const ColCompMat*> srcs;
         std::vector<ColCompMat*> targets;
         std::vector<std::mutex*> mtxs;
-        sources.reserve(anc.size());
-        targets.reserve(anc.size());
-        mtxs.reserve(anc.size());
-        for (int64_t k : anc) {
-            if (k < j) continue;  // 目标 (j,k)：j ≤ k，k ∈ A_j ∪ {j}
-            ColCompMat* source = nullptr;
-            {
+        targets.reserve(anc.size() - m);
+        mtxs.reserve(anc.size() - m);
+        if (noSuffix) srcs.reserve(anc.size() - m);
+        for (size_t t = m; t < anc.size(); ++t) {
+            const int64_t k = anc[t];
+            if (noSuffix) {
+                ColCompMat* source = nullptr;
                 Entry* entry = slot_(reducedKey_(true, nodeI, k));
                 if (!entry) {
-                    AMLS_LOG_ERROR(
-                        "accumulateReducedStiffness 失败：K 源块 ({},{}) 槽位缺失。",
-                        nodeI, k);
+                    AMLS_LOG_ERROR("accumulateReducedStiffness 失败：K 源块 "
+                                   "({},{}) 槽位缺失。",
+                                   nodeI, k);
                     return false;
                 }
-                if (!ensureReduced_(true, nodeI, k, *entry, source)) return false;
+                if (!ensureReduced_(true, nodeI, k, *entry, source))
+                    return false;
+                srcs.push_back(source);
             }
             Entry* targetEntry = slot_(reducedKey_(true, j, k));
             if (!targetEntry) {
@@ -303,10 +333,14 @@ bool GaussEliminationModule::accumulateReducedStiffness(int64_t nodeI) {
                     return false;
                 targets.push_back(target);
             }
-            sources.push_back(source);
             mtxs.push_back(&targetEntry->mtx);
         }
-        if (!opsColAccBatchTrans(*psi, sources, targets, mtxs)) {
+        const bool ok = noSuffix
+                            ? opsColAccBatchTrans(*psi, srcs, targets, mtxs)
+                            : opsColAccBatchTransSuffix(*psi, re,
+                                                        static_cast<int64_t>(m),
+                                                        targets, mtxs);
+        if (!ok) {
             AMLS_LOG_ERROR(
                 "accumulateReducedStiffness 失败：K̃ (j,{}) += Ψ ({},{})ᵀ·"
                 "K̃ ({},{},·) 批量更新维度不匹配。",
@@ -378,17 +412,17 @@ bool GaussEliminationModule::accumulateReducedMass(int64_t nodeI) {
                 nodeI, j);
             return false;
         }
-        // 固定 (nodeI, j)：两项共享 B 的转置累加各拼一次 dgemm，
-        // 项1 B=Ψ_j × C=M̃(nodeI,·)，项2 B=M_temp_j × C=Ψ(nodeI,·)。
+    }
+    static const bool noSuffix =
+        std::getenv("AAMS_NO_TRANS_SUFFIX") != nullptr;
+    // 共享右端 ×2（项1 B=Ψ_j × C=M̃(nodeI,·)；项2 B=M_temp_j × C=Ψ(nodeI,·)），
+    // anc 升序 → j = anc[m] 的 k≥j 为段后缀 [m, nSeg)。
+    TransRightEnd re1, re2;
+    if (!noSuffix) {
         std::vector<const ColCompMat*> src1, src2;
-        std::vector<ColCompMat*> targets;
-        std::vector<std::mutex*> mtxs;
         src1.reserve(anc.size());
         src2.reserve(anc.size());
-        targets.reserve(anc.size());
-        mtxs.reserve(anc.size());
         for (int64_t k : anc) {
-            if (k < j) continue;
             const auto* psiK = getPsi(nodeI, k);
             if (!psiK || !psiK->numericReady()) {
                 AMLS_LOG_ERROR(
@@ -405,7 +439,55 @@ bool GaussEliminationModule::accumulateReducedMass(int64_t nodeI) {
                         nodeI, k);
                     return false;
                 }
-                if (!ensureReduced_(false, nodeI, k, *entry, source)) return false;
+                if (!ensureReduced_(false, nodeI, k, *entry, source))
+                    return false;
+            }
+            src1.push_back(source);
+            src2.push_back(psiK);
+        }
+        if (!src1.empty()) {
+            if (!opsTransBuildRightEnd(src1.front()->rows(), src1, re1) ||
+                !opsTransBuildRightEnd(src2.front()->rows(), src2, re2))
+                return false;
+        }
+    }
+    for (size_t m = 0; m < anc.size(); ++m) {
+        const int64_t j = anc[m];
+        const auto* psiJ = getPsi(nodeI, j);
+        const auto* mtemp = getMTemp(nodeI, j);
+        std::vector<const ColCompMat*> src1, src2;
+        std::vector<ColCompMat*> targets;
+        std::vector<std::mutex*> mtxs;
+        targets.reserve(anc.size() - m);
+        mtxs.reserve(anc.size() - m);
+        if (noSuffix) {
+            src1.reserve(anc.size() - m);
+            src2.reserve(anc.size() - m);
+        }
+        for (size_t t = m; t < anc.size(); ++t) {
+            const int64_t k = anc[t];
+            if (noSuffix) {
+                const auto* psiK = getPsi(nodeI, k);
+                if (!psiK || !psiK->numericReady()) {
+                    AMLS_LOG_ERROR(
+                        "accumulateReducedMass 失败：Ψ ({},{}) 缺失或未数值就绪。",
+                        nodeI, k);
+                    return false;
+                }
+                ColCompMat* source = nullptr;
+                {
+                    Entry* entry = slot_(reducedKey_(false, nodeI, k));
+                    if (!entry) {
+                        AMLS_LOG_ERROR(
+                            "accumulateReducedMass 失败：M 源块 ({},{}) 槽位缺失。",
+                            nodeI, k);
+                        return false;
+                    }
+                    if (!ensureReduced_(false, nodeI, k, *entry, source))
+                        return false;
+                }
+                src1.push_back(source);
+                src2.push_back(psiK);
             }
             Entry* targetEntry = slot_(reducedKey_(false, j, k));
             if (!targetEntry) {
@@ -420,12 +502,18 @@ bool GaussEliminationModule::accumulateReducedMass(int64_t nodeI) {
                     return false;
                 targets.push_back(target);
             }
-            src1.push_back(source);
-            src2.push_back(psiK);
             mtxs.push_back(&targetEntry->mtx);
         }
-        if (!opsColAccBatchTrans(*psiJ, src1, targets, mtxs) ||
-            !opsColAccBatchTrans(*mtemp, src2, targets, mtxs)) {
+        const bool ok = noSuffix
+                            ? opsColAccBatchTrans(*psiJ, src1, targets, mtxs) &&
+                                  opsColAccBatchTrans(*mtemp, src2, targets, mtxs)
+                            : opsColAccBatchTransSuffix(*psiJ, re1,
+                                                        static_cast<int64_t>(m),
+                                                        targets, mtxs) &&
+                                  opsColAccBatchTransSuffix(*mtemp, re2,
+                                                            static_cast<int64_t>(m),
+                                                            targets, mtxs);
+        if (!ok) {
             AMLS_LOG_ERROR(
                 "accumulateReducedMass 失败：M̃ (j,·) += Ψ ({},{})ᵀ·M̃ + "
                 "M_temp ({},{})ᵀ·Ψ 批量更新维度不匹配。",
