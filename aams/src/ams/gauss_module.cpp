@@ -79,8 +79,12 @@ bool GaussEliminationModule::initialize(const OriginalBlocks& blocks) {
     useGemv_ = useColAccGemv();
 
     // 1. 槽位：K/M 对角 + 耦合 + Ψ/M_temp 方向槽位（运行期零 map 插入）。
+    //    先数准再 reserve，避免 rehash + unique_ptr 全量搬移。
+    int64_t sumAnc = 0;
+    for (int64_t i = 0; i < N_; ++i)
+        sumAnc += static_cast<int64_t>(tree_->ancestors(i).size());
     slots_.clear();
-    slots_.reserve(static_cast<size_t>(N_) * 4);
+    slots_.reserve(static_cast<size_t>(N_ * 2 + 4 * sumAnc));
     for (int64_t i = 0; i < N_; ++i) {
         const int64_t ni = blocks.size(i);
         for (bool stiffness : {true, false}) {

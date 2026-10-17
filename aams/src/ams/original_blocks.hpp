@@ -60,7 +60,8 @@ private:
     /// 单遍双扫抽取：pass1 计数 reserve，pass2 按列升序插入。
     void extract_(const SparseMatrix& A,
                   std::unordered_map<int64_t, SparseMatrix>& diag,
-                  std::unordered_map<int64_t, SparseMatrix>& coup);
+                  std::unordered_map<int64_t, SparseMatrix>& coup,
+                  const char* tag = "?");
 
     const SeparatorTree& tree_;
     int64_t N_ = 0;

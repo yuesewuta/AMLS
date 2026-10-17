@@ -207,23 +207,35 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
     if (opt.verbosity > 0)
         std::cerr << "[aams] reduction: " << nTreeNodes << " substructures\n"
                   << std::flush;
+    const bool redCloseLog = std::getenv("AAMS_RED_CLOSE_LOG") != nullptr;
+    const auto ts0 = Clock::now();
     OriginalBlocks ob(reordered, tree);
     reordered.K.resize(0, 0);
     reordered.M.resize(0, 0);
+    const auto ts1 = Clock::now();
 
     GaussEliminationModule gauss;
+    const auto tg0 = Clock::now();
     if (!gauss.initialize(ob))
         throw std::runtime_error("消去模块初始化失败");
+    const auto tg1 = Clock::now();
     EigenPairSaver saver;
     if (!saver.initialize(nTreeNodes, true))
         throw std::runtime_error("特征对存储初始化失败");
     SubspaceMassSaver massSaver;
     if (!massSaver.initialize(tree))
         throw std::runtime_error("子空间质量存储初始化失败");
+    const auto tg2 = Clock::now();
     TempBlockManager temp;
     if (!temp.initialize(tree, &gauss, &saver, &massSaver))
         throw std::runtime_error("临时块管理器初始化失败");
     NodeTaskStateStore states(nTreeNodes);
+    if (redCloseLog)
+        std::fprintf(stderr,
+                     "[redclose] OriginalBlocks=%.1fms gaussInit=%.1fms "
+                     "savers=%.1fms tempInit=%.1fms\n",
+                     seconds(ts0, ts1) * 1e3, seconds(tg0, tg1) * 1e3,
+                     seconds(tg1, tg2) * 1e3, seconds(tg2, Clock::now()) * 1e3);
 
     // ApplyClassicCutoffs / ApplyEnhancedCutoffs 分发 [R]：
     //   默认 ω1²；根层（rootDepth==0）ωlast²；增强标记（levelFromLeaf ≤
@@ -265,10 +277,17 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
     const int nodeThreads = std::max(1, static_cast<int>(
         std::llround(static_cast<double>(threads) / 1.5)));
     {
+        const bool redCloseLog = std::getenv("AAMS_RED_CLOSE_LOG") != nullptr;
+        const auto tp0 = Clock::now();
         ThreadPool nodePool(nodeThreads);
         ThreadPool branchPool(threads);
+        const auto tp1 = Clock::now();
         if (!exec.runNodeOrder(nodePool, branchPool))
             throw std::runtime_error("Reduction Phase 失败（详见日志）");
+        const auto tp2 = Clock::now();
+        if (redCloseLog)
+            std::fprintf(stderr, "[redclose] poolCtor=%.1fms runOrder=%.1fms\n",
+                         seconds(tp0, tp1) * 1e3, seconds(tp1, tp2) * 1e3);
     }
     sol.timing["REDUCTION"] = seconds(t1, Clock::now());
     colOpsDumpStats();

@@ -644,9 +644,19 @@ bool opsColAccBatchStacked(
     const auto tb0 = std::chrono::steady_clock::now();
     uint64_t gathNs = 0, gemmNs = 0, scatNs = 0;
     static thread_local std::vector<double> tlCAll, tlLStack, tlY;
+    static thread_local std::vector<int64_t> tlScol;
     for (const auto& [sig, js] : groups) {
         const int64_t actB = static_cast<int64_t>(sig.size());
         const auto tg0 = std::chrono::steady_clock::now();
+        // 签名连续（活跃原始列构成连续段）时 C_all 行 gather 退化为逐列
+        // memcpy，免索引散读。
+        bool sigRun = true;
+        for (int64_t g = 1; g < actB; ++g)
+            if (sig[static_cast<size_t>(g)] != sig[0] + g) {
+                sigRun = false;
+                break;
+            }
+        const int64_t sig0 = sig[0];
         // 右端 C_all(actB × nAll)：行按签名序（与堆叠左端列对齐），
         // 列按 Ψ 段序。所有元素都会被写入。
         tlCAll.resize(static_cast<size_t>(actB * nAll));
@@ -661,8 +671,12 @@ bool opsColAccBatchStacked(
                         p.dense()
                             .col(psiCols[static_cast<size_t>(t)].first)
                             .data();
-                    for (int64_t g = 0; g < actB; ++g)
-                        col[g] = pcol[sig[static_cast<size_t>(g)]];
+                    if (sigRun)
+                        std::memcpy(col, pcol + sig0,
+                                    static_cast<size_t>(actB) * sizeof(double));
+                    else
+                        for (int64_t g = 0; g < actB; ++g)
+                            col[g] = pcol[sig[static_cast<size_t>(g)]];
                 }
             }
         }
@@ -708,7 +722,8 @@ bool opsColAccBatchStacked(
                          opsTlsThreads());
             const auto tc2 = std::chrono::steady_clock::now();
             // 逐 (d, 祖先) 持锁散加：Y 行块 [rowOff, rowOff+rows) 映射回
-            // 各目标列（覆盖性预检在锁外，与 opsColAccBatch 相同）
+            // 各目标列。覆盖性预检在锁外一次算出存储列号并缓存（散加与
+            // 激活复用，免 accDstCol/markColNonZero 的重复二分）。
             int64_t rowOff = 0;
             for (size_t k = start; k < end; ++k) {
                 const size_t j = js[k];
@@ -718,9 +733,11 @@ bool opsColAccBatchStacked(
                     const int64_t tEnd = psiColStart[a + 1];
                     if (tBeg == tEnd) continue;
                     ColCompMat& A = *targetsPerL[j][a];
-                    for (int64_t t = tBeg; t < tEnd; ++t)
-                        if (A.storageCol(
-                                psiCols[static_cast<size_t>(t)].second) < 0) {
+                    tlScol.resize(static_cast<size_t>(tEnd - tBeg));
+                    for (int64_t t = tBeg; t < tEnd; ++t) {
+                        const int64_t sc = A.storageCol(
+                            psiCols[static_cast<size_t>(t)].second);
+                        if (sc < 0) {
                             AMLS_LOG_ERROR(
                                 "[colops] {} 失败：目标 (j={},a={}) 存储列未覆盖"
                                 " Ψ 有效列（原始列 {}）。",
@@ -728,21 +745,25 @@ bool opsColAccBatchStacked(
                                 psiCols[static_cast<size_t>(t)].second);
                             return false;
                         }
+                        tlScol[static_cast<size_t>(t - tBeg)] = sc;
+                    }
+                    const double* yseg =
+                        tlY.data() + static_cast<size_t>(segOff[a]) *
+                                         static_cast<size_t>(rowsSum) +
+                        static_cast<size_t>(rowOff);
                     std::unique_lock<std::mutex> lock;
                     if (mtxsPerL[j][a])
                         lock = std::unique_lock<std::mutex>(*mtxsPerL[j][a]);
                     for (int64_t t = tBeg; t < tEnd; ++t) {
-                        double* dst = accDstCol(
-                            kWho, A, psiCols[static_cast<size_t>(t)].second);
-                        if (!dst) return false;
-                        const double* ycol =
-                            tlY.data() +
-                            static_cast<size_t>(segOff[a] + (t - tBeg)) *
-                                static_cast<size_t>(rowsSum) +
-                            static_cast<size_t>(rowOff);
+                        const int64_t sc =
+                            tlScol[static_cast<size_t>(t - tBeg)];
+                        double* __restrict dst =
+                            A.dense().col(sc).data();
+                        const double* __restrict ycol =
+                            yseg + static_cast<size_t>(t - tBeg) *
+                                       static_cast<size_t>(rowsSum);
                         for (int64_t r = 0; r < rj; ++r) dst[r] += ycol[r];
-                        A.markColNonZero(
-                            psiCols[static_cast<size_t>(t)].second);
+                        A.activateStorageCol(sc);
                     }
                 }
                 rowOff += rj;
@@ -848,7 +869,18 @@ bool opsColAccBatchTrans(const ColCompMat& B,
                  static_cast<int>(B.validCols()), opsTlsThreads());
     const auto tb2 = std::chrono::steady_clock::now();
 
-    // 逐目标持锁散射各自列段：dst[B.origColAt(sb)] += prod(sb, g)
+    // 逐目标持锁散射各自列段：dst[B.origColAt(sb)] += prod(sb, g)。
+    // B 活跃原始列/存储列均连续时内层退化为连续 AXPY（免索引散写）。
+    const size_t nb = tlActSb.size();
+    bool actRun = nb > 0;
+    for (size_t t = 1; t < nb; ++t)
+        if (tlActOrig[t] != tlActOrig[0] + static_cast<int64_t>(t) ||
+            tlActSb[t] != tlActSb[0] + static_cast<int64_t>(t)) {
+            actRun = false;
+            break;
+        }
+    const int64_t o0 = nb > 0 ? tlActOrig[0] : 0;
+    const int64_t sb0 = nb > 0 ? tlActSb[0] : 0;
     const double* pc = tlProd.data();
     for (size_t i = 0; i < Cs.size(); ++i) {
         const ColCompMat& c = *Cs[i];
@@ -858,11 +890,24 @@ bool opsColAccBatchTrans(const ColCompMat& B,
         if (mtxs[i]) lock = std::unique_lock<std::mutex>(*mtxs[i]);
         for (int64_t sc = 0; sc < c.validCols(); ++sc) {
             if (!c.colActive(sc)) continue;
-            double* dst = accDstCol(kWho, A, c.origColAt(sc));
-            if (!dst) return false;
-            for (size_t t = 0; t < tlActSb.size(); ++t)
-                dst[tlActOrig[t]] += pc[tlActSb[t]];
-            A.markColNonZero(c.origColAt(sc));
+            const int64_t od = c.origColAt(sc);
+            const int64_t scA = A.storageCol(od);
+            if (scA < 0) {
+                AMLS_LOG_ERROR(
+                    "[colops] {} 失败：A 存储列未覆盖原始列 {}。", kWho, od);
+                return false;
+            }
+            double* __restrict dst = A.dense().col(scA).data();
+            if (actRun) {
+                const double* __restrict y = pc + sb0;
+                double* __restrict d = dst + o0;
+                for (int64_t r = 0; r < static_cast<int64_t>(nb); ++r)
+                    d[r] += y[r];
+            } else {
+                for (size_t t = 0; t < nb; ++t)
+                    dst[tlActOrig[t]] += pc[tlActSb[t]];
+            }
+            A.activateStorageCol(scA);
             pc += B.validCols();
         }
     }

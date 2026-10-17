@@ -534,6 +534,9 @@ bool NodeTaskExecutor::runNodeOrder(ThreadPool& nodePool,
                     ctx->failure.load(std::memory_order_acquire) != 0);
         });
     }
+    // 诊断：REDUCTION 阶段 DAG 内外耗时分解（AAMS_RED_CLOSE_LOG）。
+    static const bool redCloseLog = std::getenv("AAMS_RED_CLOSE_LOG") != nullptr;
+    const auto tw0 = std::chrono::steady_clock::now();
     if (ctx->failure.load(std::memory_order_acquire) != 0) {
         AMLS_LOG_ERROR("runNodeOrder 失败：{} / {} 节点完成。",
                        completedNodes_.load(std::memory_order_relaxed), count);
@@ -542,8 +545,15 @@ bool NodeTaskExecutor::runNodeOrder(ThreadPool& nodePool,
 
     // 兜底整树释放（根 release 幂等；成功路径通常已在根 CompressRelease
     // 触发过）。
+    const auto tw1 = std::chrono::steady_clock::now();
     if (!temp_.release(tree_.root()))
         AMLS_LOG_WARN("根节点临时块释放异常（可能已释放）。");
+    if (redCloseLog) {
+        const auto tw2 = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[redclose] dagEnd->release=%.1fms release=%.1fms\n",
+                     std::chrono::duration<double, std::milli>(tw1 - tw0).count(),
+                     std::chrono::duration<double, std::milli>(tw2 - tw1).count());
+    }
     return true;
 }
 

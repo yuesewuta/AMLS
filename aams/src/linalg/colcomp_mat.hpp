@@ -77,6 +77,15 @@ public:
         ++nnzCount_;
     }
     void markColNonZero(const std::vector<int64_t>& origCols);
+    /// 按已知存储列号直接激活（负转正），供散加内核免重复二分；调用方
+    /// 须保证 s 来自 storageCol 查得且矩阵已数值化（语义同 markColNonZero）。
+    void activateStorageCol(int64_t s) {
+        auto& v = state_[static_cast<size_t>(s)];
+        if (v < 0) {
+            v = -v;
+            ++nnzCount_;
+        }
+    }
     /// Ψ 初始化：布局 = rhs 有效列，零缓冲（分解阶数为 0 时走此路径）。
     bool initializeConstraintFromRhs(const ColCompMat& rhs);
     /// M_temp 初始化：布局 = mass 与 psi 有效列并集，数值取 mass 对应列，
