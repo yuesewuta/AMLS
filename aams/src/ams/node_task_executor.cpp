@@ -61,6 +61,7 @@ static constexpr std::array<std::uint16_t, kDagTaskCount> kDagSuccMask = [] {
 struct DagContext {
     int64_t nodeID = -1;
     ThreadPool* pool = nullptr;
+    int prio = 0;   // 调度优先级（深度越小越靠根越优先）
     std::array<std::atomic<int32_t>, kDagTaskCount> pendingDeps{};
     std::atomic<int32_t> inFlight{0};
     std::atomic<int32_t> settled{0};
@@ -349,17 +350,28 @@ void NodeTaskExecutor::execDagTask(const std::shared_ptr<void>& ctxVoid,
     static_assert(sizeof(kRunners) / sizeof(kRunners[0]) == kDagTaskCount);
 
     // 刷新本 worker 的 dgemm 借线程预算：池并发 ÷ 在飞任务数（含排队
-    // 即将启动的），夹到 [1,8] 防过度订阅。此前 opsTlsThreads 无人写入，
-    // 算子层全部 dgemm 实际单线程。dgemmColsRaw 内部再按列数限段数。
+    // 即将启动的）。关键链尾部独占机器时在飞=1，可借满整池——近根
+    // CompressUpdate 的批量 dgemm 占链时长的大头。
     {
         const int cap = dag->pool ? dag->pool->size() : 1;
         const int run =
             std::max(1, dag->inFlight.load(std::memory_order_relaxed));
-        opsTlsThreads() = std::max(1, std::min(8, cap / run));
+        opsTlsThreads() = std::max(1, std::min(cap, cap / run));
     }
 
     bool ok = false;
     const auto tStart = std::chrono::steady_clock::now();
+    if (timelineOn_) {
+        const std::size_t slot =
+            static_cast<std::size_t>(dag->nodeID) * kDagTaskCount + taskIdx;
+        taskStartNs_[slot].store(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    tStart.time_since_epoch())
+                    .count()) -
+                t0Ns_,
+            std::memory_order_relaxed);
+    }
     try {
         ok = (this->*kRunners[taskIdx])(dag->nodeID);
     } catch (const std::exception& e) {
@@ -367,10 +379,21 @@ void NodeTaskExecutor::execDagTask(const std::shared_ptr<void>& ctxVoid,
                        e.what());
         ok = false;
     }
+    const auto tEnd = std::chrono::steady_clock::now();
+    if (timelineOn_) {
+        const std::size_t slot =
+            static_cast<std::size_t>(dag->nodeID) * kDagTaskCount + taskIdx;
+        taskEndNs_[slot].store(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    tEnd.time_since_epoch())
+                    .count()) -
+                t0Ns_,
+            std::memory_order_relaxed);
+    }
     taskNanos_[taskIdx].fetch_add(
         static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - tStart)
+            std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tStart)
                 .count()),
         std::memory_order_relaxed);
     taskCounts_[taskIdx].fetch_add(1, std::memory_order_relaxed);
@@ -393,7 +416,7 @@ void NodeTaskExecutor::execDagTask(const std::shared_ptr<void>& ctxVoid,
             for (std::size_t s : ready)
                 dag->pool->enqueue([this, ctxVoid, s](int) {
                     execDagTask(ctxVoid, s);
-                });
+                }, dag->prio);
         }
     }
 
@@ -410,6 +433,7 @@ bool NodeTaskExecutor::runNodeParallelDag(int64_t nodeID,
     auto ctx = std::make_shared<DagContext>();
     ctx->nodeID = nodeID;
     ctx->pool = &branchPool;
+    ctx->prio = depthAt_(nodeID);
     for (std::size_t t = 0; t < kDagTaskCount; ++t) {
         const auto mask = kDagDepMask[t];
         ctx->pendingDeps[t] = static_cast<int32_t>(__builtin_popcount(mask));
@@ -418,10 +442,10 @@ bool NodeTaskExecutor::runNodeParallelDag(int64_t nodeID,
     ctx->inFlight.store(2, std::memory_order_release);
     ctx->pool->enqueue([this, ctx](int) {
         execDagTask(ctx, idx(NodeTaskKind::SolveLocalEigenPair));
-    });
+    }, ctx->prio);
     ctx->pool->enqueue([this, ctx](int) {
         execDagTask(ctx, idx(NodeTaskKind::GaussConstraint));
-    });
+    }, ctx->prio);
     std::unique_lock<std::mutex> lock(ctx->mtx);
     ctx->cv.wait(lock, [&ctx]() {
         return ctx->inFlight.load(std::memory_order_acquire) == 0 &&
@@ -455,7 +479,7 @@ void NodeTaskExecutor::execNodeTask(const std::shared_ptr<void>& ctxVoid,
             order->inFlight.fetch_add(1, std::memory_order_acq_rel);
             order->nodePool->enqueue([this, ctxVoid, parent](int) {
                 execNodeTask(ctxVoid, parent);
-            });
+            }, depthAt_(parent));
         }
     }
 
@@ -474,12 +498,18 @@ bool NodeTaskExecutor::runNodeOrder(ThreadPool& nodePool,
         AMLS_LOG_ERROR("runNodeOrder 失败：空树。");
         return false;
     }
+    if (timelineOn_)
+        t0Ns_ = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
     auto ctx = std::make_shared<OrderContext>(count);
     ctx->nodePool = &nodePool;
     ctx->pool = &branchPool;
     for (int64_t i = 0; i < count; ++i)
         ctx->unfinishedChildren[static_cast<size_t>(i)] =
             static_cast<int32_t>(tree_.node(i).children.size());
+    buildDepths_();
 
     // 叶子先入队；父节点由 execNodeTask 级联。
     int64_t leaves = 0;
@@ -487,7 +517,8 @@ bool NodeTaskExecutor::runNodeOrder(ThreadPool& nodePool,
         if (!tree_.node(i).children.empty()) continue;
         ctx->inFlight.fetch_add(1, std::memory_order_acq_rel);
         ++leaves;
-        nodePool.enqueue([this, ctx, i](int) { execNodeTask(ctx, i); });
+        nodePool.enqueue([this, ctx, i](int) { execNodeTask(ctx, i); },
+                         depthAt_(i));
     }
     if (leaves == 0) {
         AMLS_LOG_ERROR("runNodeOrder 失败：无叶子节点。");
@@ -529,6 +560,49 @@ std::vector<int64_t> NodeTaskExecutor::profileTaskCounts() const {
     for (std::size_t i = 0; i < taskCounts_.size(); ++i)
         out[i] = taskCounts_[i].load(std::memory_order_relaxed);
     return out;
+}
+
+void NodeTaskExecutor::buildDepths_() {
+    const int64_t n = tree_.nNodes();
+    depth_.assign(static_cast<size_t>(n), -1);
+    for (int64_t i = 0; i < n; ++i) {
+        if (depth_[static_cast<size_t>(i)] >= 0) continue;
+        // 沿父链上溯到已知深度，再回填整条路径
+        std::vector<int64_t> path;
+        int64_t cur = i;
+        while (cur >= 0 && depth_[static_cast<size_t>(cur)] < 0) {
+            path.push_back(cur);
+            cur = tree_.node(cur).parent;
+        }
+        int d = cur >= 0 ? depth_[static_cast<size_t>(cur)] + 1 : 0;
+        for (auto it = path.rbegin(); it != path.rend(); ++it)
+            depth_[static_cast<size_t>(*it)] = d++;
+    }
+}
+
+void NodeTaskExecutor::dumpTimeline(const std::string& path) const {
+    if (!timelineOn_) return;
+    std::ofstream f(path);
+    if (!f) {
+        AMLS_LOG_WARN("时间线转储无法写入：{}", path);
+        return;
+    }
+    f << "node,task,start_ns,end_ns\n";
+    const int64_t n = tree_.nNodes();
+    for (int64_t node = 0; node < n; ++node)
+        for (std::size_t t = 0; t < kDagTaskCount; ++t) {
+            const std::size_t slot =
+                static_cast<std::size_t>(node) * kDagTaskCount + t;
+            const std::uint64_t s =
+                taskStartNs_[slot].load(std::memory_order_relaxed);
+            const std::uint64_t e =
+                taskEndNs_[slot].load(std::memory_order_relaxed);
+            if (e > s) f << node << ',' << t << ',' << s << ',' << e << '\n';
+        }
+    // 树边：task=-1 行，start_ns 存 parent（供关键链离线分析）
+    for (int64_t node = 0; node < n; ++node)
+        f << node << ",-1,"
+          << tree_.node(node).parent << ",0\n";
 }
 
 } // namespace aams

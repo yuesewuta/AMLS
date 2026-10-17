@@ -62,6 +62,22 @@ bool opsColAccBatch(const ColCompMat& L,
                     const std::vector<ColCompMat*>& targets,
                     const std::vector<std::mutex*>& mtxs);
 
+/// 堆叠批量非转置累加：对 j = 0..Ls.size()-1、祖先 a，
+/// targetsPerL[j][a] += Ls[j] · psis[a]。所有左块共享同一 Ψ 列表
+/// （CompressUpdate：同一 node 的全部 descendant d，Ψ(node,a) 只读共享）。
+///
+/// 相比逐 d 调 opsColAccBatch 的收益：活跃原始列签名相同的 d 共享一次
+/// C_all gather（原先每个 d 重建一遍相同的右端）；行堆叠后单次 dgemm
+/// 的固定开销由整组 d 摊薄（OpenBLAS m=1 的 ~0.9ms/次固定成本，m≤128
+/// 持平，m=1→128 单行成本约降 125×）。每目标列的累加次序不变，结果
+/// 与逐 d 一致（容许 gemm 分块带来的末位 ulp 差异）。
+/// Ls[j] 0 活跃列按恒零贡献跳过，对应目标仍需调用方倒计数。
+bool opsColAccBatchStacked(
+    const std::vector<const ColCompMat*>& Ls,
+    const std::vector<const ColCompMat*>& psis,
+    const std::vector<std::vector<ColCompMat*>>& targetsPerL,
+    const std::vector<std::vector<std::mutex*>>& mtxsPerL);
+
 /// 批量转置累加：targets[i] += Bᵀ · Cs[i]（i = 0..Cs.size()-1）。
 ///
 /// GaussKAccum / GaussMAccum 专用：固定 B（Ψ_j 或 M_temp_j），向全部

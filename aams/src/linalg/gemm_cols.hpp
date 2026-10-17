@@ -82,6 +82,14 @@ inline void dgemmColsRaw(CBLAS_TRANSPOSE ta, int m, int n, int k,
     if (n <= 0 || m <= 0) return;
     static const bool forceSerial = std::getenv("AMLS_DGEMM_SERIAL") != nullptr;
     if (forceSerial) nthreads = 1;
+    // 小乘法直接串行：ThreadGroup 每次 spawn/join/pin 的固定开销 ms 级，
+    // 而关键链上大量小调用（如 1×3×66）的 flops 只有 µs 级，分段并行
+    // 净亏千倍（cant_20 时间线实测：链节点 ~29 次批量 × ~7ms 线程开销）。
+    if (2.0 * static_cast<double>(m) * n * k < 3e7) {
+        cblas_dgemm(CblasColMajor, ta, CblasNoTrans, m, n, k, alpha, A, lda,
+                    B, ldb, beta, C, ldc);
+        return;
+    }
     nthreads = std::min<int>(nthreads, (n + 31) / 32);
     // 手工列分块与 BLAS 预算共用容量：借不到（队列忙/互斥被占）就串行。
     blas::ScopedReservation reserve(nthreads);
@@ -137,6 +145,14 @@ inline void dgemmCols(CBLAS_TRANSPOSE ta, CBLAS_TRANSPOSE tb, double alpha,
     }
     static const bool forceSerial = std::getenv("AMLS_DGEMM_SERIAL") != nullptr;
     if (forceSerial) nthreads = 1;
+    // 同 dgemmColsRaw：小乘法串行，免 ThreadGroup 固定开销。
+    if (2.0 * static_cast<double>(m) * n * k < 3e7) {
+        cblas_dgemm(CblasColMajor, ta, tb, m, n, k, alpha, A.data(),
+                    static_cast<int>(A.rows()), B.data(),
+                    static_cast<int>(B.rows()), beta, C.data(),
+                    static_cast<int>(C.rows()));
+        return;
+    }
     nthreads = std::min<int>(nthreads, static_cast<int>((n + 31) / 32));
     blas::ScopedReservation reserve(nthreads);
     nthreads = reserve.threads;

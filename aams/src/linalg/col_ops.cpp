@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <utility>
 
 #include <openblas/cblas.h>
@@ -32,6 +33,9 @@ struct OpAccStats {
     std::atomic<uint64_t> hist[5] = {{0},{0},{0},{0},{0}};
     std::atomic<uint64_t> histNs[5] = {{0},{0},{0},{0},{0}};
     std::atomic<uint64_t> bElems{0};
+    // 批量累加分段计时（opsColAccBatch / opsColAccBatchTrans）
+    std::atomic<uint64_t> batchCalls{0};
+    std::atomic<uint64_t> batchGatherNs{0}, batchGemmNs{0}, batchScatterNs{0};
 };
 OpAccStats& opAccStats() {
     static OpAccStats s;
@@ -72,6 +76,12 @@ void colOpsDumpStats() {
                  static_cast<double>(st.histNs[2].load(std::memory_order_relaxed)) * 1e-9,
                  static_cast<double>(st.histNs[3].load(std::memory_order_relaxed)) * 1e-9,
                  static_cast<double>(st.histNs[4].load(std::memory_order_relaxed)) * 1e-9);
+    std::fprintf(stderr,
+                 "[prof] colAcc batch: calls=%llu gather=%.3fs gemm=%.3fs scatter=%.3fs\n",
+                 (unsigned long long)st.batchCalls.load(std::memory_order_relaxed),
+                 static_cast<double>(st.batchGatherNs.load(std::memory_order_relaxed)) * 1e-9,
+                 static_cast<double>(st.batchGemmNs.load(std::memory_order_relaxed)) * 1e-9,
+                 static_cast<double>(st.batchScatterNs.load(std::memory_order_relaxed)) * 1e-9);
 }
 
 int32_t sytrfFactor(DefaultTraits::DenseMatrix& a,
@@ -460,6 +470,8 @@ bool opsColAccBatch(const ColCompMat& L,
     // 同时记录原始列号供右端行 gather。
     const int64_t actB = L.activeCols();
     if (actB == 0) return true;  // 恒零贡献：所有目标由调用方直接倒计数
+    const auto tb0 = opAccEnabled() ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
     static thread_local std::vector<double> tlL, tlC, tlY;
     static thread_local std::vector<int64_t> tlOrigB;
     tlL.resize(static_cast<size_t>(L.rows() * actB));
@@ -504,6 +516,7 @@ bool opsColAccBatch(const ColCompMat& L,
             }
         }
     }
+    const auto tb1 = std::chrono::steady_clock::now();
 
     tlY.resize(static_cast<size_t>(L.rows() * nAll));
     dgemmColsRaw(CblasNoTrans, static_cast<int>(L.rows()),
@@ -511,6 +524,7 @@ bool opsColAccBatch(const ColCompMat& L,
                  tlL.data(), static_cast<int>(L.rows()), tlC.data(),
                  static_cast<int>(actB), 0.0, tlY.data(),
                  static_cast<int>(L.rows()), opsTlsThreads());
+    const auto tb2 = std::chrono::steady_clock::now();
 
     // 逐目标持锁散加各自列段（Ψ_a 的有效列 ↔ C_all 全局列段）。
     int64_t off = 0;
@@ -541,6 +555,236 @@ bool opsColAccBatch(const ColCompMat& L,
             ++off;
         }
     }
+    if (opAccEnabled()) {
+        const auto tb3 = std::chrono::steady_clock::now();
+        auto& bs = opAccStats();
+        const auto ns = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
+        };
+        bs.batchCalls.fetch_add(1, std::memory_order_relaxed);
+        bs.batchGatherNs.fetch_add(ns(tb0, tb1), std::memory_order_relaxed);
+        bs.batchGemmNs.fetch_add(ns(tb1, tb2), std::memory_order_relaxed);
+        bs.batchScatterNs.fetch_add(ns(tb2, tb3), std::memory_order_relaxed);
+        static const bool logBig =
+            std::getenv("AAMS_BATCH_LOG") != nullptr;
+        if (logBig && ns(tb0, tb3) > 3000000)  // >3ms 的调用逐个打点
+            std::fprintf(stderr,
+                         "[batch] L %lld×%lld actB=%lld nAll=%lld thr=%d "
+                         "gather=%.2fms gemm=%.2fms scatter=%.2fms\n",
+                         (long long)L.rows(), (long long)L.validCols(),
+                         (long long)actB, (long long)nAll, opsTlsThreads(),
+                         ns(tb0, tb1) / 1e6, ns(tb1, tb2) / 1e6,
+                         ns(tb2, tb3) / 1e6);
+    }
+    return true;
+}
+
+bool opsColAccBatchStacked(
+    const std::vector<const ColCompMat*>& Ls,
+    const std::vector<const ColCompMat*>& psis,
+    const std::vector<std::vector<ColCompMat*>>& targetsPerL,
+    const std::vector<std::vector<std::mutex*>>& mtxsPerL) {
+    constexpr const char* kWho = "opsColAccBatchStacked";
+    if (Ls.size() != targetsPerL.size() || Ls.size() != mtxsPerL.size()) {
+        AMLS_LOG_ERROR("[colops] {} 失败：Ls/targets/mtxs 数量不一致。", kWho);
+        return false;
+    }
+    if (Ls.empty()) return true;
+    for (size_t j = 0; j < Ls.size(); ++j) {
+        if (!colCompShapeOk(kWho, "L", *Ls[j])) return false;
+        if (targetsPerL[j].size() != psis.size() ||
+            mtxsPerL[j].size() != psis.size()) {
+            AMLS_LOG_ERROR("[colops] {} 失败：左块 {} 的目标/锁数与 Ψ 数不一致。",
+                           kWho, j);
+            return false;
+        }
+    }
+    for (size_t a = 0; a < psis.size(); ++a)
+        if (!colCompShapeOk(kWho, "psi", *psis[a])) return false;
+    for (size_t j = 0; j < Ls.size(); ++j)
+        for (size_t a = 0; a < psis.size(); ++a)
+            if (psis[a]->rows() != Ls[j]->totalCols()) {
+                AMLS_LOG_ERROR(
+                    "[colops] {} 失败：Ψ {} 行数 {} ≠ 左块 {} 总列数 {}。",
+                    kWho, a, psis[a]->rows(), j, Ls[j]->totalCols());
+                return false;
+            }
+
+    // 共享右端布局：各 Ψ 的有效列（存储列, 原始列）与全局列段偏移。
+    // 右端对所有左块相同（Ψ 只读共享），只需构建一次。
+    int64_t nAll = 0;
+    std::vector<int64_t> segOff(psis.size(), 0);
+    std::vector<int64_t> psiColStart(psis.size() + 1, 0);
+    std::vector<std::pair<int64_t, int64_t>> psiCols;  // (存储列, 原始列)
+    for (size_t a = 0; a < psis.size(); ++a) {
+        segOff[a] = nAll;
+        for (int64_t sc = 0; sc < psis[a]->validCols(); ++sc) {
+            if (!psis[a]->colActive(sc)) continue;
+            psiCols.emplace_back(sc, psis[a]->origColAt(sc));
+        }
+        psiColStart[a + 1] = static_cast<int64_t>(psiCols.size());
+        nAll += psis[a]->activeCols();
+    }
+    if (nAll == 0) return true;
+
+    // 左块按活跃原始列签名分组（存储列序 = 原始列升序）：同签名共享
+    // C_all；0 活跃列恒零贡献跳过（调用方直接倒计数）
+    std::map<std::vector<int64_t>, std::vector<size_t>> groups;
+    for (size_t j = 0; j < Ls.size(); ++j) {
+        if (Ls[j]->activeCols() == 0) continue;
+        std::vector<int64_t> sig;
+        sig.reserve(static_cast<size_t>(Ls[j]->activeCols()));
+        for (int64_t sb = 0; sb < Ls[j]->validCols(); ++sb)
+            if (Ls[j]->colActive(sb)) sig.push_back(Ls[j]->origColAt(sb));
+        groups[std::move(sig)].push_back(j);
+    }
+
+    const auto tb0 = std::chrono::steady_clock::now();
+    uint64_t gathNs = 0, gemmNs = 0, scatNs = 0;
+    static thread_local std::vector<double> tlCAll, tlLStack, tlY;
+    for (const auto& [sig, js] : groups) {
+        const int64_t actB = static_cast<int64_t>(sig.size());
+        const auto tg0 = std::chrono::steady_clock::now();
+        // 右端 C_all(actB × nAll)：行按签名序（与堆叠左端列对齐），
+        // 列按 Ψ 段序。所有元素都会被写入。
+        tlCAll.resize(static_cast<size_t>(actB * nAll));
+        {
+            double* cd = tlCAll.data();
+            for (size_t a = 0; a < psis.size(); ++a) {
+                const ColCompMat& p = *psis[a];
+                for (int64_t t = psiColStart[a]; t < psiColStart[a + 1]; ++t) {
+                    double* col = cd;
+                    cd += static_cast<size_t>(actB);
+                    const double* pcol =
+                        p.dense()
+                            .col(psiCols[static_cast<size_t>(t)].first)
+                            .data();
+                    for (int64_t g = 0; g < actB; ++g)
+                        col[g] = pcol[sig[static_cast<size_t>(g)]];
+                }
+            }
+        }
+        const auto tg1 = std::chrono::steady_clock::now();
+        // 行预算分块：Y 行数 × nAll 上限 ~32M 双精度（Y 为最大临时）
+        const int64_t rowCap = std::max<int64_t>(256, 4000000 / nAll);
+        size_t start = 0;
+        while (start < js.size()) {
+            int64_t rowsSum = 0;
+            size_t end = start;
+            while (end < js.size() &&
+                   (rowsSum == 0 ||
+                    rowsSum + Ls[js[end]]->rows() <= rowCap)) {
+                rowsSum += Ls[js[end]]->rows();
+                ++end;
+            }
+            // 堆叠左端：列 g = 各 L 的签名原始列 g 对应存储列（组内
+            // 各 L 的活跃原始列集合与 sig 相同，只是存储排布可不同）
+            tlLStack.resize(static_cast<size_t>(rowsSum * actB));
+            {
+                double* ld = tlLStack.data();
+                int64_t rowOff = 0;
+                for (size_t k = start; k < end; ++k) {
+                    const ColCompMat& L = *Ls[js[k]];
+                    for (int64_t g = 0; g < actB; ++g)
+                        std::memcpy(
+                            ld + static_cast<size_t>(g) * rowsSum +
+                                static_cast<size_t>(rowOff),
+                            L.dense()
+                                .col(L.storageCol(sig[static_cast<size_t>(g)]))
+                                .data(),
+                            static_cast<size_t>(L.rows()) * sizeof(double));
+                    rowOff += L.rows();
+                }
+            }
+            tlY.resize(static_cast<size_t>(rowsSum * nAll));
+            const auto tc1 = std::chrono::steady_clock::now();
+            dgemmColsRaw(CblasNoTrans, static_cast<int>(rowsSum),
+                         static_cast<int>(nAll), static_cast<int>(actB), 1.0,
+                         tlLStack.data(), static_cast<int>(rowsSum),
+                         tlCAll.data(), static_cast<int>(actB), 0.0,
+                         tlY.data(), static_cast<int>(rowsSum),
+                         opsTlsThreads());
+            const auto tc2 = std::chrono::steady_clock::now();
+            // 逐 (d, 祖先) 持锁散加：Y 行块 [rowOff, rowOff+rows) 映射回
+            // 各目标列（覆盖性预检在锁外，与 opsColAccBatch 相同）
+            int64_t rowOff = 0;
+            for (size_t k = start; k < end; ++k) {
+                const size_t j = js[k];
+                const int64_t rj = Ls[j]->rows();
+                for (size_t a = 0; a < psis.size(); ++a) {
+                    const int64_t tBeg = psiColStart[a];
+                    const int64_t tEnd = psiColStart[a + 1];
+                    if (tBeg == tEnd) continue;
+                    ColCompMat& A = *targetsPerL[j][a];
+                    for (int64_t t = tBeg; t < tEnd; ++t)
+                        if (A.storageCol(
+                                psiCols[static_cast<size_t>(t)].second) < 0) {
+                            AMLS_LOG_ERROR(
+                                "[colops] {} 失败：目标 (j={},a={}) 存储列未覆盖"
+                                " Ψ 有效列（原始列 {}）。",
+                                kWho, j, a,
+                                psiCols[static_cast<size_t>(t)].second);
+                            return false;
+                        }
+                    std::unique_lock<std::mutex> lock;
+                    if (mtxsPerL[j][a])
+                        lock = std::unique_lock<std::mutex>(*mtxsPerL[j][a]);
+                    for (int64_t t = tBeg; t < tEnd; ++t) {
+                        double* dst = accDstCol(
+                            kWho, A, psiCols[static_cast<size_t>(t)].second);
+                        if (!dst) return false;
+                        const double* ycol =
+                            tlY.data() +
+                            static_cast<size_t>(segOff[a] + (t - tBeg)) *
+                                static_cast<size_t>(rowsSum) +
+                            static_cast<size_t>(rowOff);
+                        for (int64_t r = 0; r < rj; ++r) dst[r] += ycol[r];
+                        A.markColNonZero(
+                            psiCols[static_cast<size_t>(t)].second);
+                    }
+                }
+                rowOff += rj;
+            }
+            start = end;
+            const auto tc3 = std::chrono::steady_clock::now();
+            const auto nsAcc = [](auto a, auto b) {
+                return static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                        .count());
+            };
+            gemmNs += nsAcc(tc1, tc2);
+            scatNs += nsAcc(tc2, tc3);
+        }
+        const auto nsAcc = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
+        };
+        gathNs += nsAcc(tg0, tg1);
+    }
+    if (opAccEnabled()) {
+        const auto tb3 = std::chrono::steady_clock::now();
+        auto& bs = opAccStats();
+        const auto ns = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
+        };
+        bs.batchCalls.fetch_add(1, std::memory_order_relaxed);
+        bs.batchGatherNs.fetch_add(gathNs, std::memory_order_relaxed);
+        bs.batchGemmNs.fetch_add(gemmNs, std::memory_order_relaxed);
+        bs.batchScatterNs.fetch_add(scatNs, std::memory_order_relaxed);
+        static const bool logBig = std::getenv("AAMS_BATCH_LOG") != nullptr;
+        if (logBig && ns(tb0, tb3) > 3000000)  // >3ms 的调用逐个打点
+            std::fprintf(stderr,
+                         "[batchS] nL=%zu groups=%zu nAll=%lld thr=%d "
+                         "gather=%.2fms gemm=%.2fms scatter=%.2fms\n",
+                         Ls.size(), groups.size(), (long long)nAll,
+                         opsTlsThreads(), gathNs / 1e6, gemmNs / 1e6,
+                         scatNs / 1e6);
+    }
     return true;
 }
 
@@ -557,6 +801,7 @@ bool opsColAccBatchTrans(const ColCompMat& B,
     for (size_t i = 0; i < Cs.size(); ++i)
         if (!colCompShapeOk(kWho, "C", *Cs[i])) return false;
     if (B.activeCols() == 0) return true;
+    const auto tb0 = std::chrono::steady_clock::now();
 
     // B 的有效行（存储列号 + 原始列号）预提取，散射循环零判断
     static thread_local std::vector<int64_t> tlActSb, tlActOrig;
@@ -595,11 +840,13 @@ bool opsColAccBatchTrans(const ColCompMat& B,
 
     // prod(B.validCols × nAll) = Bᵀ · C_all（占位行的乘积被散射丢弃）
     tlProd.resize(static_cast<size_t>(B.validCols() * nAll));
+    const auto tb1 = std::chrono::steady_clock::now();
     dgemmColsRaw(CblasTrans, static_cast<int>(B.validCols()),
                  static_cast<int>(nAll), static_cast<int>(B.rows()), 1.0,
                  B.dense().data(), static_cast<int>(B.rows()), tlC.data(),
                  static_cast<int>(B.rows()), 0.0, tlProd.data(),
                  static_cast<int>(B.validCols()), opsTlsThreads());
+    const auto tb2 = std::chrono::steady_clock::now();
 
     // 逐目标持锁散射各自列段：dst[B.origColAt(sb)] += prod(sb, g)
     const double* pc = tlProd.data();
@@ -618,6 +865,19 @@ bool opsColAccBatchTrans(const ColCompMat& B,
             A.markColNonZero(c.origColAt(sc));
             pc += B.validCols();
         }
+    }
+    if (opAccEnabled()) {
+        const auto tb3 = std::chrono::steady_clock::now();
+        auto& bs = opAccStats();
+        const auto ns = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
+        };
+        bs.batchCalls.fetch_add(1, std::memory_order_relaxed);
+        bs.batchGatherNs.fetch_add(ns(tb0, tb1), std::memory_order_relaxed);
+        bs.batchGemmNs.fetch_add(ns(tb1, tb2), std::memory_order_relaxed);
+        bs.batchScatterNs.fetch_add(ns(tb2, tb3), std::memory_order_relaxed);
     }
     return true;
 }

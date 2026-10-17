@@ -30,6 +30,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -45,7 +47,10 @@
 
 namespace aams {
 
-/// 固定 worker 线程池（FIFO 队列；任务签名 void(int threadId)）。
+/// 固定 worker 线程池（优先级队列；任务签名 void(int threadId)）。
+/// enqueue 的 priority 越小越先执行（0 = 最高）：REDUCTION 关键链靠近
+/// 根的节点若按 FIFO 排在叶洪流之后，关键路径会被排队延迟主导
+/// （cant_20 时间线实测：链上小节点任务共 ~4ms 却贡献 ~140ms）。
 class ThreadPool {
 public:
     explicit ThreadPool(int numThreads) {
@@ -61,8 +66,9 @@ public:
                             return stop_ || !tasks_.empty();
                         });
                         if (stop_ && tasks_.empty()) return;
-                        task = std::move(tasks_.front());
-                        tasks_.pop_front();
+                        task = std::move(
+                            const_cast<PrioritizedTask&>(tasks_.top()).task);
+                        tasks_.pop();
                     }
                     task(t);
                 }
@@ -79,10 +85,10 @@ public:
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
-    void enqueue(std::function<void(int)> f) {
+    void enqueue(std::function<void(int)> f, int priority = 0) {
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            tasks_.push_back(std::move(f));
+            tasks_.push({std::move(f), priority, ++seq_});
         }
         cv_.notify_one();
     }
@@ -90,10 +96,25 @@ public:
     int size() const { return static_cast<int>(workers_.size()); }
 
 private:
+    struct PrioritizedTask {
+        std::function<void(int)> task;
+        int priority = 0;
+        std::uint64_t seq = 0;
+    };
+    struct EarlierFirst {
+        bool operator()(const PrioritizedTask& a,
+                        const PrioritizedTask& b) const {
+            if (a.priority != b.priority) return a.priority > b.priority;
+            return a.seq > b.seq;
+        }
+    };
     std::vector<std::thread> workers_;
     std::mutex mtx_;
     std::condition_variable cv_;
-    std::deque<std::function<void(int)>> tasks_;
+    std::priority_queue<PrioritizedTask, std::vector<PrioritizedTask>,
+                        EarlierFirst>
+        tasks_;
+    std::uint64_t seq_ = 0;
     bool stop_ = false;
 };
 
@@ -229,6 +250,15 @@ public:
             static_cast<std::size_t>(NodeTaskKind::Count));
         taskCounts_ = std::vector<std::atomic<std::int64_t>>(
             static_cast<std::size_t>(NodeTaskKind::Count));
+        timelineOn_ = std::getenv("AAMS_TASK_TIMELINE") != nullptr;
+        if (timelineOn_) {
+            taskStartNs_ = std::vector<std::atomic<std::uint64_t>>(
+                static_cast<std::size_t>(tree_.nNodes()) *
+                static_cast<std::size_t>(NodeTaskKind::Count));
+            taskEndNs_ = std::vector<std::atomic<std::uint64_t>>(
+                static_cast<std::size_t>(tree_.nNodes()) *
+                static_cast<std::size_t>(NodeTaskKind::Count));
+        }
     }
 
     /// 节点序执行全部节点（叶子先入队、父节点级联）；失败返回 false
@@ -243,6 +273,10 @@ public:
     /// 与调用次数，下标即 NodeTaskKind。
     std::vector<double> profileTaskSeconds() const;
     std::vector<int64_t> profileTaskCounts() const;
+
+    /// 时间线转储（AAMS_TASK_TIMELINE=1 时记录）：CSV "node,taskIdx,
+    /// startNs,endNs"，相对 runNodeOrder 起点，用于关键路径离线分析。
+    void dumpTimeline(const std::string& path) const;
 
 private:
     // 11 任务入口（幂等；失败经 states_.firstFailure 短路）。
@@ -262,6 +296,13 @@ private:
     void execDagTask(const std::shared_ptr<void>& ctx, std::size_t taskIdx);
     void execNodeTask(const std::shared_ptr<void>& ctx, int64_t nodeID);
 
+    /// 节点深度（根=0，叶子最深）缓存；小值=靠根=高调度优先级。
+    void buildDepths_();
+    int depthAt_(int64_t nodeID) const {
+        return depth_[static_cast<size_t>(nodeID)];
+    }
+    std::vector<int> depth_;
+
     const SeparatorTree& tree_;
     GaussEliminationModule& gauss_;
     TempBlockManager& temp_;
@@ -271,6 +312,11 @@ private:
     std::atomic<int64_t> completedNodes_{0};
     std::vector<std::atomic<std::uint64_t>> taskNanos_;
     std::vector<std::atomic<std::int64_t>> taskCounts_;
+    // AAMS_TASK_TIMELINE=1：每(节点,任务) start/end（ns，相对 t0Ns_）
+    bool timelineOn_ = false;
+    std::uint64_t t0Ns_ = 0;
+    std::vector<std::atomic<std::uint64_t>> taskStartNs_;
+    std::vector<std::atomic<std::uint64_t>> taskEndNs_;
 };
 
 } // namespace aams

@@ -272,6 +272,8 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
     }
     sol.timing["REDUCTION"] = seconds(t1, Clock::now());
     colOpsDumpStats();
+    if (std::getenv("AAMS_TASK_TIMELINE") != nullptr)
+        exec.dumpTimeline("aams_timeline.csv");
     if (opt.verbosity > 0)
         std::cout << "[aams] reduction done: substructures=" << nTreeNodes
                   << " threads=" << threads << "（节点池 " << nodeThreads
