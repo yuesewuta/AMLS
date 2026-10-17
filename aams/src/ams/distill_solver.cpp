@@ -100,15 +100,34 @@ DistillResult distillRitz(const DefaultTraits::DenseMatrix& Kr,
 
     // ---- 1. 蒸馏过滤（含初始子空间过滤，取两者较紧）----
     // Rayleigh 商 ρ_i = Kr(i,i)/Mr(i,i)；缩减基下对角商即该基向量的谱坐标。
+    // 阈值过滤后按 pme_SolverParameters[0xa0]=3000（子空间迭代规模上限 [R]）
+    // 用最低 ρ 的剩余向量补足——Abaqus 的迭代子空间由蒸馏保留 + 规模上限
+    // 共同决定，而非仅阈值（纯阈值过滤会把起始子空间削得过穷）。
     const double lamKeep = std::min(lamDistill, lamInit);
-    std::vector<int64_t> keep;
-    keep.reserve(static_cast<size_t>(n));
+    std::vector<std::pair<double, int64_t>> rhoAll;
+    rhoAll.reserve(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) {
         const double mii = Mr(i, i);
         const double rho = mii > 0.0 ? Kr(i, i) / mii
                                      : std::numeric_limits<double>::infinity();
-        if (rho <= lamKeep) keep.push_back(i);
+        rhoAll.emplace_back(rho, i);
     }
+    const int64_t cap = std::min(p.subspaceMax, n);
+    std::vector<int64_t> keep;
+    keep.reserve(static_cast<size_t>(cap));
+    for (const auto& [rho, i] : rhoAll)
+        if (rho <= lamKeep) keep.push_back(i);
+    if (static_cast<int64_t>(keep.size()) < cap) {
+        std::vector<std::pair<double, int64_t>> rest;
+        for (const auto& [rho, i] : rhoAll)
+            if (rho > lamKeep) rest.push_back({rho, i});
+        std::sort(rest.begin(), rest.end());
+        for (const auto& [rho, i] : rest) {
+            if (static_cast<int64_t>(keep.size()) >= cap) break;
+            keep.push_back(i);
+        }
+    }
+    std::sort(keep.begin(), keep.end());
     res.distilledSize = static_cast<int64_t>(keep.size());
     if (dumpOn())
         std::fprintf(stderr,

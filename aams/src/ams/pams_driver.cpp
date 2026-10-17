@@ -300,6 +300,7 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
         dp.cutoff3 = par.cutoff3;
         dp.shift = par.globalShift;
         dp.subspaceIteration = opt.subspaceIteration;
+    dp.subspaceMax = par.subspaceMax;
         dp.extractOrder = par.nev;
         rea::DistillResult dr = rea::distillRitz(reducedK, reducedM, dp);
         reducedK.resize(0, 0);
