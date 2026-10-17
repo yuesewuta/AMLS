@@ -134,50 +134,150 @@ REDUCTION 5.66 → 5.0 s。精度逐位一致（λ1=30096.77893，12 阶全同�
 批量化后同样成立（4/8/16 线程 wall 均 ~4.9 s）。这意味着继续压缩
 REDUCTION 必须砍关键路径本身（见 §5），堆线程无效。
 
-## 4. 当前状态（2026-10-17）
+### 3.10 DISTILL ritz：dsyevd 全谱 → dsyevr 频段区间（3.2 → 1.56 s）
 
-3 次连跑（16 线程，AAMS_PROFILE=1）：
+ritz 原来对 p×p（p=3000）投影矩阵做 `dsyevd` 全谱分解，但消费端只要
+λ∈(0, (2πfmax)²]。改 `dsyevr`（MRRR）`range='V'`、区间
+[−1e300, (2πfmax)²]：ritz 3.2 → 1.56 s，TOTAL 9.6 s。
 
-| 阶段 | 优化前 | 现在 |
-|---|---|---|
-| METIS | 0.4 | 0.39–0.42 |
-| REDUCTION | 8.2（任务和 69 核秒） | **5.0（任务和 ~27 核秒）** |
-| DISTILL | 87 → 4.2 | 4.8–5.0 |
-| RECOVERY | 0.2 | 0.17–0.19 |
-| **TOTAL** | **~65** | **10.8–12.4（最好 10.76）** |
+**坑（重要）**：`dsyevr` 的 Z **不得与 A 别名**——DORMTR 回变换要从 A
+的严格三角读 Householder 反射子，就地覆盖会破坏特征向量。症状：残差
+0.546 → 0.998（特征值因最终 REDUCED_EIGENSOLUTION 在蒸馏子空间重解而
+仍正确，极具迷惑性）。修复 = 独立 Z 缓冲（72 MB，可接受）。
+commit acdec96。
 
-精度：12 阶特征值与 scipy 参考 0.06–0.2% 内，残差 first=0.546/last=0.599，
-与优化前逐位一致。
+### 3.11 蒸馏子空间规模上限 --subspace-max（TOTAL 9.6 → 6.4 s）
 
-距目标（≤~2 s）还差 **~5×**。
+Abaqus `pme_SolverParameters[0xa0]=3000` 是子空间**容量上限**而非目标
+维数：cant_20 自然蒸馏过滤仅保留 10/3348 个 Ritz 向量，top-up 补到
+2990——白算 99.7%。新增 `--subspace-max`（默认 0=3000）：
 
-## 5. 剩余差距量化路线
+| S | TOTAL | λ12 相对 .dat | 备注 |
+|---|---|---|---|
+| 3000 | 9.6 | ~4.1% | 默认（保护 cutoff1=8 精度档） |
+| 1200 | 6.4 | ~4.3% | **基准配置**，仅 +0.14% |
+| 800 | 5.4 | ~5.5%（λ8 +4.2%） | 超 4% 协议，弃 |
+| 600 | — | f12=119.3 Hz 贴边 | 弃 |
+| 400 | — | 仅 9 阶 <120 Hz | 弃 |
 
-REDUCTION wall 5.0 s 但任务和只 ~27 核秒（16 线程利用率 ~34%）——
-关键路径约束。分解：
+cutoff1=8 精度档保持默认 3000 不受影响。commit 3c7d4e4。
 
-1. **CompressUpdate 9.2 核秒**：批量后剩余成本是拼接 gather
-   （O(actB×nAll)）+ 散射 + dgemm 的内存流。可做：Ψ 列与 L 有效列
-   顺序一致时免 gather 直乘；散射融合进 dgemm 输出（beta=1 直写目标，
-   需目标列布局连续）。
-2. **SolveLocalEigenPair 4.9 核秒**：叶/中层 dsygvx 局部特征。Abaqus
-   用 sygst/sytrd/stev 四步链。对深层大块可试 dsygvd（分治）或区间
-   dsyevr。
-3. **关键路径串行链**：树深处大节点的 9 段 DAG 串行。Abaqus k_updext
-   仅 0.066 s/线程 —— 其 Reduction 是全稠密块单次 dgemm 链。结构上
-   可探索：层间流水（上层节点 Gauß 与下层 Compress 重叠）、大节点
-   CompressUpdate 的 dgemm 多线程化（当前 opsTlsThreads 预算制）。
-4. **DISTILL ritz 3.2 s**：dsyevd(3000) 的三对角化 O(n³) 占主导。
-   候选：p′ 降维（3000→2000 需验证精度）、dsyevr 只取 12 阶（省分治
-   不省三对角化）、或把正交归一并入 dsygvd 广义型（免 ortho_y 1.1 s）。
-5. **测量的注意事项**：机器后台负载（ZCode/ToDesk/ChatGPT 等）可致
-   1.3–2× 膨胀；对拍时取多次最小值。`AAMS_COLCOMP_VALIDATE=1` 可恢复
-   全量校验；`AAMS_NO_FUSED=1` 强制逐列路径（A/B 用）。
+### 3.12 优先级调度 + 关键链时间线（node_task_executor）
+
+- ThreadPool 由 FIFO 改**优先级队列**（树深优先，根=0 最高）——链上
+  小节点不再排在叶洪泛后面（单节点排队 140ms → 3ms）。
+- `AAMS_TASK_TIMELINE=1` 导出 per-(node,task) 时间线 CSV（含树边），
+  配 Python 关键链 DP（自底向上取 max-end 子女）。
+
+效果：链节点排队消除，但 wall 不变——链小节点延迟是叶洪泛挤占的
+**果**不是**因**；wall 仍由叶洪泛 + 近根串行链构成。
+
+### 3.13 dgemmColsRaw 小乘法门控
+
+批量 op 内部大量 1×3×66 级微 gemm 曾走 ThreadGroup：spawn/join/pin
+固定开销 ms 级（实测 L 1×3×66 耗 7.67ms，flops 仅 ~400）。加门控：
+`2mnk < 3e7` 直接串行 cblas_dgemm。gemm 核秒 11.5 → 5.0。
+
+### 3.14 CompressUpdate 堆叠批量化（REDUCTION 3.04 → 1.73 s）★最大单项
+
+时间线关键链分解（REDUCTION 3.04s）：36 链节点 = 叶洪泛 ~0.5s +
+链尾 CUpdate ~2.5s。链节点 CUpdate 单个 100–270ms，全在逐 d 循环：
+每个 d 调一次 `opsColAccBatch`（m=1 微 gemm）。
+
+微基准实锤：OpenBLAS m=1, k=120, n=1000 单次 **0.87ms**（flops 仅
+240K），且 **m≤128 调用耗时持平**——m=1→128 单行成本 ~125×。而同一
+node 的全部 descendant 共享同一 Ψ 列表（右端相同）：
+
+新增 `opsColAccBatchStacked(Ls, psis, targetsPerL, mtxsPerL)`：
+1. 左块按**活跃原始列签名**分组（同签名 → 共享一次 C_all gather，
+   原先每个 d 重建一遍相同右端，gather 8.2 核秒大半是冗余）；
+2. 组内行堆叠（预算 4M 双精度/块），单次 dgemm 出 Y= L_stack·C_all；
+3. 逐 (d,祖先) 持锁散射（与逐 d 完全相同的落点与累加次序）。
+
+`updateColComp_` 重构为：0 行 d 即时倒计数，数值 d 预检并收集，
+段末单次堆叠调用，成功后统一倒计数；d 按线程数取模分段并行（8 段）。
+
+效果：批量核时 gather 8.2→1.19s、gemm 14.0→2.51s（calls 149k→79k），
+REDUCTION 3.04 → **1.73 s**，TOTAL 6.4 → **3.04 s**（best-of-5）。
+残差逐位不变（0.5555962051/0.6026538919），cutoff1=8 精度档对 .dat
+偏差 ~0.4% 不变。commit 7574e02。
+
+### 3.15 负结果存档（避免重试）
+
+1. **GaussMAccum 内层 j 循环并行**（j 目标块互不相交，结构上安全）：
+   REDUCTION 1.75 → 2.1–2.3s，**反升**。改按池空闲容量
+   （opsTlsThreads=池并发÷在飞）门控仍 2.07–2.18s。教训：溢洪期不是
+   纯吞吐受限——每节点 MAccum/CUpdate 的**墙钟直接串进其后代的就绪
+   时间**，内层并行不省 core-time 反摊 ThreadGroup spawn 与冗余
+   gather，节点尾延迟变长连锁拖慢整片排空。近根节点 anc≈树深≈30，
+   几乎所有节点都满足"大 nj"条件，内层并行=给 2601 个节点各配 8 线程。
+2. **CUpdate 分段数 8→12**（nd/32）：1.77–1.86s，不优于 8。8 是甜点。
+3. **池空闲容量门控 CUpdate 段数**（溢洪串行/链尾并行）：2.07–2.18s，
+   同 1 的机理反升。
+
+## 4. 当前状态（2026-10-17，§3.14 后）
+
+best-of-5（16 线程，AAMS_PROFILE=1，--subspace-max 1200）：
+
+| 阶段 | 优化前 | §3.9 后 | 现在 |
+|---|---|---|---|
+| METIS 排序+建树 | 0.4 | 0.39–0.42 | 0.44（未动） |
+| REDUCTION | 8.2（69 核秒） | 5.0（~27 核秒） | **1.73–1.79（批量核时：gather 1.2 + gemm 2.5 + scatter 3.6）** |
+| DISTILL | 87 → 4.2 | 4.8–5.0 | 0.35（S=1200） |
+| REDUCED_EIGENSOLUTION | — | — | 0.51–0.67 |
+| RECOVERY | 0.2 | 0.17–0.19 | 0.05 |
+| **TOTAL** | **~65** | **10.8–12.4** | **3.04–3.23（best 3.04）** |
+
+精度：cutoff1=5 基准档 12 阶对 Abaqus .dat 4.3% 内（高阶模态，截断主导，
+与 Abaqus 同 cutoff1 的差距见逆向文档）；cutoff1=8 精度档 ~0.4%；
+残差与优化前逐位一致。
+
+距目标（≤~2.0 s）还差 **~1.5×**。
+
+## 5. 剩余差距量化路线（更新）
+
+当前 wall 构成（时间线实测）：METIS 0.44 + REDUCTION 1.75 +
+EIG(含 DISTILL) 0.67 + RECOVERY/ASSEMBLE 0.1 + 启动 IO ~0.1。
+
+REDUCTION 1.75s 分解：叶洪泛 ~0.74s（任务和 12.9 核秒 ÷16 ≈ 0.80s，
+已接近完美并行下限）+ 链尾重叠段 ~0.49s + 收尾串行 ~0.4s。继续压缩
+的杠杆按 ROI 排序：
+
+1. **散射向量化/融合**（batch scatter 3.6 核秒，现最大核时项）：
+   trans 路径 `dst[tlActOrig[t]] += pc[tlActSb[t]]` 是索引 gather-scatter
+   标量循环；非转置路径逐列标量加。候选： Scatter 段按列连续性分派
+   memcpy/AXPY；或 beta=1 直写（需目标列布局连续性证明，涉及预留列
+   定理的存储列排布）。
+2. **MAccum C_all 复用**（MAccum 3.19 核秒，O(depth²) 对累积）：
+   逐 j 调 BatchTrans 时右端是 Ψ(nodeI,k≥j)/M̃(nodeI,k≥j) 的后缀——
+   按 j 从大到小增量扩展右端可省 ~一半 gather；两 term 可垂叠 B 成
+   一次 gemm（[Ψ_j;M_temp_j]ᵀ[C1;C2]，省一半调用开销）。注意 §3.15
+   教训：只省 core-time 的改动才有效，须配 A/B。
+3. **SolveLocalEigenPair 2.71 核秒**：dsygvx 链上每叶 ~1ms。Abaqus
+   四步链（sygst/sytrd/stev）合计 0.29s/线程。候选：叶节点用
+   dsyevr 区间（同 §3.10 手法）。
+4. **METIS 0.44s**：单线程固定成本。可探索与矩阵解析重叠（流水）或
+   更轻的 ordering（对 26460 阶可能 nd 选项调优收益有限）。
+5. **结构级（对标 Abaqus k_updext 0.066s/线程）**：Abaqus 的 Reduction
+   是全稠密 front 块沿树单次 dgemm 链，无 O(depth²) 对块、无列压缩
+   gather/scatter。这是剩余 ~2× 差距的根本来源；若上述 1–4 用尽仍
+   达标无望，需评估 pair-blocks → frontal 块重构（工程量大，另行立项）。
+6. **测量注意**：机器后台负载可致 1.3–2× 膨胀，取多次最小值；
+   `AAMS_CUPDATE_LOG=1` 每节点 CUpdate 墙钟、`AAMS_BATCH_LOG=1` >3ms
+   批量打点、`AAMS_TASK_TIMELINE=1` 时间线 CSV。
 
 ## 6. 复现命令
 
 ```bash
 export PATH="/d/msys2/mingw64/bin:/d/msys2/usr/bin:$PATH"
 cd aams && cmake --build build -j 8
-AAMS_PROFILE=1 ./build/aams_solve.exe   --K ../bench_abaqus/cant_20_K.mtx --M ../bench_abaqus/cant_20_M.mtx   --fmin 0 --fmax 120 --cutoff1 5 --reduced distill --threads 16
+# 基准档（对标 Abaqus 默认 cutoff1=5）：
+AAMS_PROFILE=1 ./build/aams_solve.exe \
+  --K /z/codeSpace/AMLS/bench_abaqus/cant_20_K.mtx \
+  --M /z/codeSpace/AMLS/bench_abaqus/cant_20_M.mtx \
+  --fmin 0 --fmax 120 --cutoff1 5 --reduced distill \
+  --threads 16 --subspace-max 1200
+# 精度档（对 .dat ~0.4%）：
+#   --cutoff1 8（不加 --subspace-max，默认 3000）
+# 关键链/瓶颈分析：AAMS_TASK_TIMELINE=1（CSV）+ AAMS_CUPDATE_LOG=1
 ```

@@ -86,11 +86,16 @@ Abaqus AMS 参考（`bench_abaqus/cant_20.dat`，120Hz）：12 阶，
 关键机制：蒸馏阈值过滤后按 `pme_SolverParameters[0xa0]=3000`（迭代子空间
 规模上限 [R]）以最低 Rayleigh 商向量补足——纯阈值过滤会把起始子空间削得
 过穷（cutoff1=5 时 3348→10）。cutoff1=8 时 p=18485 → p'=3000，一次子空间
-迭代 + Ritz 即达上述精度。
+迭代 + Ritz 即达上述精度。`--subspace-max N` 可覆盖上限（cutoff1=5 基准档
+用 1200：自然过滤仅 10/3348，S=1200 对截断主导的误差仅 +0.14%，实测
+S≤800 开始破坏 4% 协议）。
 
-性能现状（cant_20，16 线程）：Reduction 9.8s + Reduced 55s + Recovery 0.2s
-≈ 65s；Abaqus（4 线程，cant_20.times 合计）约 2–4s——差距主要在缩聚 DAG
-与稠密内核的常数因子，属后续优化项（见 `docs/abaqus_ams/` 优化计划）。
+性能现状（cant_20，16 线程，2026-10-17 深挖后，详见
+`docs/abaqus_ams/AAMS性能深挖_cant_20.md`）：基准档（cutoff1=5 +
+`--subspace-max 1200`）TOTAL 3.04–3.23 s（best 3.04；REDUCTION 1.73s +
+EIG 0.67s + METIS 0.44s）；Abaqus（4 线程 .times 合计 1.258s）wall
+≈1.4–1.65s——还差 ~1.5×，剩余路线在该文档 §5（散射向量化、MAccum
+右端复用、及最终的结构级 pair-blocks→frontal 重构）。
 
 已知差距（rea 树 cutoff1=5 高阶 4–5%）：Abaqus 在同 cutoff1 下更准，来自其
 `k_clique/k_updext` 跨级直连传播与第二截断（0.6·cutoff1）的界面模态保留
