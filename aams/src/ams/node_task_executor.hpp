@@ -87,6 +87,8 @@ public:
         cv_.notify_one();
     }
 
+    int size() const { return static_cast<int>(workers_.size()); }
+
 private:
     std::vector<std::thread> workers_;
     std::mutex mtx_;

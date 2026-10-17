@@ -1,10 +1,13 @@
 #include "ams/node_task_executor.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <fstream>
 #include <cstdio>
 #include <exception>
+
+#include "linalg/gemm_cols.hpp"
 
 namespace aams {
 
@@ -344,6 +347,16 @@ void NodeTaskExecutor::execDagTask(const std::shared_ptr<void>& ctxVoid,
         &NodeTaskExecutor::runCompressRelease,
     };
     static_assert(sizeof(kRunners) / sizeof(kRunners[0]) == kDagTaskCount);
+
+    // 刷新本 worker 的 dgemm 借线程预算：池并发 ÷ 在飞任务数（含排队
+    // 即将启动的），夹到 [1,8] 防过度订阅。此前 opsTlsThreads 无人写入，
+    // 算子层全部 dgemm 实际单线程。dgemmColsRaw 内部再按列数限段数。
+    {
+        const int cap = dag->pool ? dag->pool->size() : 1;
+        const int run =
+            std::max(1, dag->inFlight.load(std::memory_order_relaxed));
+        opsTlsThreads() = std::max(1, std::min(8, cap / run));
+    }
 
     bool ok = false;
     const auto tStart = std::chrono::steady_clock::now();

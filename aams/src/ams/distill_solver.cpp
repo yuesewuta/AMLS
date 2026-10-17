@@ -325,7 +325,9 @@ DistillResult distillRitz(const DefaultTraits::DenseMatrix& Kr,
                 throw std::runtime_error(
                     "distillRitz: 子空间退化（M 正交化失败）");
         }
-        // Ritz 分析：K̂ = YᵀK2Y（M̂ ≈ I，标准特征问题，dsyevd 分治）
+        // Ritz 分析：K̂ = YᵀK2Y（M̂ ≈ I，标准特征问题）。消费端只取
+        // (bandLo, bandHi] 频段，故用 dsyevr(MRRR) 区间求解替代 dsyevd
+        // 全谱分治，且 V = Y·Z 只需 p2×m 而非 p2×p2 全乘。
         ProfScope profRitz("ritz");
         DefaultTraits::DenseMatrix K2Y, Kh;
         blas::gemm0(CblasNoTrans, CblasNoTrans, K2, Y, K2Y);
@@ -333,24 +335,38 @@ DistillResult distillRitz(const DefaultTraits::DenseMatrix& Kr,
         blas::gemm(CblasTrans, CblasNoTrans, 1.0, Y, K2Y, 0.0, Kh);
         int32_t n32 = static_cast<int32_t>(p2);
         std::vector<double> w(static_cast<size_t>(p2));
+        std::vector<int32_t> isuppz(static_cast<size_t>(2 * p2));
         double wk = 0.0;
         int32_t iwk = 0;
         int32_t lq = -1;
-        dsyevd_("V", "L", &n32, Kh.data(), &n32, w.data(), &wk, &lq, &iwk,
-                &lq, &info);
+        const double vl = bandLo, vu = bandHi;
+        const double abstol = 0.0;
+        int32_t mFound = 0;
+        int32_t il = 0, iu = 0;
+        // range='V' 时 M 事先未知，Z 须备满 p2 列；且 Z 不得与 A 别名
+        // （DORMTR 回代要读 A 内 Householder 反射子）。
+        DefaultTraits::DenseMatrix Z(p2, p2);
+        dsyevr_("V", "V", "L", &n32, Kh.data(), &n32, &vl, &vu, &il, &iu,
+                &abstol, &mFound, w.data(), Z.data(), &n32, isuppz.data(),
+                &wk, &lq, &iwk, &lq, &info);
         if (info != 0)
-            throw std::runtime_error("distillRitz: dsyevd 工作区查询失败");
+            throw std::runtime_error("distillRitz: dsyevr 工作区查询失败");
         std::vector<double> work(static_cast<size_t>(wk));
         std::vector<int32_t> iwork(static_cast<size_t>(iwk));
         const int32_t lw3 = static_cast<int32_t>(work.size());
         const int32_t liw3 = static_cast<int32_t>(iwork.size());
-        dsyevd_("V", "L", &n32, Kh.data(), &n32, w.data(), work.data(),
-                &lw3, iwork.data(), &liw3, &info);
+        dsyevr_("V", "V", "L", &n32, Kh.data(), &n32, &vl, &vu, &il, &iu,
+                &abstol, &mFound, w.data(), Z.data(), &n32, isuppz.data(),
+                work.data(), &lw3, iwork.data(), &liw3, &info);
         if (info != 0)
             throw std::runtime_error("distillRitz: Ritz 特征求解失败");
-        blas::gemm0(CblasNoTrans, CblasNoTrans, Y, Kh, V);
-        lam.resize(p2);
-        for (int64_t i = 0; i < p2; ++i) lam(i) = w[static_cast<size_t>(i)];
+        // 只回乘频段列：V = Y·Z(:,1:mFound)
+        const int64_t mB = static_cast<int64_t>(mFound);
+        if (mB > 0)
+            blas::gemm0(CblasNoTrans, CblasNoTrans, Y,
+                        Z.leftCols(mB), V);
+        lam.resize(mB);
+        for (int64_t i = 0; i < mB; ++i) lam(i) = w[static_cast<size_t>(i)];
         profRitz.end();
     } else {
         // 无子空间迭代：直接对 (K2, M2) 做广义 Ritz（dsygvd 分治）
