@@ -74,14 +74,23 @@ Abaqus AMS 参考（`bench_abaqus/cant_20.dat`，120Hz）：12 阶，
 | 配置 | λ1 偏差 | 高阶最大偏差 | 阶数 |
 |---|---|---|---|
 | AAMS（rea 树，cutoff1=5，direct） | 0.10%（vs .dat） | ~5%（λ12） | 12 ✓ |
-| AAMS（rea 树，cutoff1=8，direct） | （扫描中） | | |
+| **AAMS（rea 树，cutoff1=8，direct）** | **0.011%** | **≤0.25%（全部 13 阶）** | 13 ✓ |
 | amls_solve（nd 树，γ=5） | 0.03% | ~0.6% | 12 ✓ |
 
-已知差距（rea 树高阶 4–5%）：Abaqus 在同 cutoff1 下更准，来自其
+cutoff1=8 时 p=18485，稠密缩聚解 702s（Reduction 仅 9.6s）——瓶颈在
+整体稠密特征求解。Abaqus 以分层蒸馏避免该开销（`--reduced distill` 为其
+稠密适配，起始子空间较穷，精度待改进）；按子树分组的蒸馏实现是后续
+性能对标的关键项（逆向文档 §5"待深挖"）。
+
+已知差距（rea 树 cutoff1=5 高阶 4–5%）：Abaqus 在同 cutoff1 下更准，来自其
 `k_clique/k_updext` 跨级直连传播与第二截断（0.6·cutoff1）的界面模态保留
 ——本实现的列压缩缩聚未复刻该机制（对应逆向文档 §5"待深挖"项）。
-残差 ~0.3–0.6 为截断型子结构的固有属性（恢复向量缺高频成分，λ 精度
+残差 ~0.25–0.6 为截断型子结构的固有属性（恢复向量缺高频成分，λ 精度
 才是验收指标，见 `docs/` 验收协议 eigenvalueRelErr ≤ 4%）。
+
+输入守卫：K 含 |K|max>1e20（Abaqus 1e36 大数法约束占位，如
+`cant_10_STIF2_full.mtx`）时报错——Abaqus 在 PROCESSING CONSTRAINTS
+阶段消化约束，矩阵工作流输入须先做约束后处理。
 
 ## 目录
 

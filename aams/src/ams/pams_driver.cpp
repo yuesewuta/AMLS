@@ -133,6 +133,19 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
         throw std::invalid_argument("cutoff1 必须为正");
     const int64_t n = KM.K.rows();
     if (n == 0) throw std::invalid_argument("空矩阵");
+    // Abaqus 在 PROCESSING CONSTRAINTS 阶段先行消化约束（大数法 1e36 占位
+    // 由此消除）；矩阵工作流输入若仍含大数占位，特征问题被污染——明确报错
+    // 而非产出垃圾模态。
+    {
+        double maxAbs = 0.0;
+        for (int64_t c = 0; c < KM.K.outerSize(); ++c)
+            for (DefaultTraits::SparseMatrix::InnerIterator it(KM.K, c); it; ++it)
+                maxAbs = std::max(maxAbs, std::abs(it.value()));
+        if (maxAbs > 1e20)
+            throw std::invalid_argument(
+                "K 含 |K|max>1e20 的大数约束占位（Abaqus 1e36 大数法），"
+                "请先做约束后处理再求解");
+    }
 
     // OpenBLAS（OpenMP 版）线程与本工程线程池互踩：BLAS 永久单线程。
     blas::setNumThreads(1);
