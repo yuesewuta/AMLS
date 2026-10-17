@@ -39,6 +39,7 @@ struct AmsOptions {
     double cutoff2 = 1.7;   // 蒸馏阈值乘子
     double cutoff3 = 1.1;   // 初始子空间乘子
     int64_t nev = 0;        // >0: 输出截到前 nev 阶（Abaqus 语义：不影响提取）
+    int64_t subspaceMax = 0; // >0: 覆盖蒸馏子空间规模上限（0=par 默认 3000）
     int numThreads = 0;     // <=0 = 硬件并发数
 
     // ---- 隐藏参数（默认 false 时由 applyEnv 按 ABA_PAMS_* 读取）----

@@ -159,6 +159,7 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
     par.cutoff2 = opt.cutoff2;
     par.cutoff3 = opt.cutoff3;
     par.nev = opt.nev;
+    if (opt.subspaceMax > 0) par.subspaceMax = opt.subspaceMax;
     par.lastCutoff = opt.lastCutoff;
     par.enhancedEnabled = opt.enhancedEnabled;
     par.enhancedCutoff = opt.enhancedCutoff;

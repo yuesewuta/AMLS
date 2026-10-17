@@ -77,6 +77,7 @@ Args parse(int argc, char** argv) {
         else if (s == "--K") a.kFile = next();
         else if (s == "--M") a.mFile = next();
         else if (s == "--nev") a.opt.nev = std::stoll(next());
+        else if (s == "--subspace-max") a.opt.subspaceMax = std::stoll(next());
         else if (s == "--fmin") a.opt.fminHz = std::stod(next());
         else if (s == "--fmax") a.opt.fmaxHz = std::stod(next());
         else if (s == "--cutoff1") a.opt.cutoff1 = std::stod(next());

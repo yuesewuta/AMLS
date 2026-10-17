@@ -220,6 +220,7 @@ DistillResult distillRitz(const DefaultTraits::DenseMatrix& Kr,
     keep.reserve(static_cast<size_t>(cap));
     for (const auto& [rho, i] : rhoAll)
         if (rho <= lamKeep) keep.push_back(i);
+    const int64_t natCount = static_cast<int64_t>(keep.size());
     if (static_cast<int64_t>(keep.size()) < cap) {
         std::vector<std::pair<double, int64_t>> rest;
         for (const auto& [rho, i] : rhoAll)
@@ -234,9 +235,11 @@ DistillResult distillRitz(const DefaultTraits::DenseMatrix& Kr,
     res.distilledSize = static_cast<int64_t>(keep.size());
     profFilter.end();
     if (dumpOn())        std::fprintf(stderr,
-                     "[distill] p=%lld λ2=%.6e λ3=%.6e 蒸馏后 p'=%lld\n",
+                     "[distill] p=%lld λ2=%.6e λ3=%.6e 蒸馏后 p'=%lld "
+                     "(自然过滤 %lld, 补足 %lld)\n",
                      (long long)n, lamDistill, lamInit,
-                     (long long)res.distilledSize);
+                     (long long)res.distilledSize, (long long)natCount,
+                     (long long)(res.distilledSize - natCount));
     if (keep.empty()) return res;
 
     DefaultTraits::DenseMatrix K2, M2;
