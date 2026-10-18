@@ -119,8 +119,35 @@ bool finishTask(NodeTaskStateStore& states, int64_t nodeID, NodeTaskKind task,
 
 // ---- 11 任务入口 ----
 
-bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {
-    const auto& nd = tree_.node(nodeID);
+namespace {
+/// Gershgorin 空区间预判：广义 λmin(K,M) ≥ minGersh(K)/maxGersh(M)
+/// （M 正定；minGersh(A)=min_i(A_ii−Σ_{j≠i}|A_ij|)，maxGersh(B) 用
+/// 行和上界估计 λmax(B)）。下界 > hi ⇒ (−∞,hi] 内必无特征值，可直接
+/// 走索引回退，免一次注定空手的 dsygvx 区间调用 + 双份块装载。
+/// K/M 需为上下对称满存储（uplo='L' 读下三角即可，行和对角取下三角）。
+bool intervalGuaranteedEmpty(const DenseMatrix& K, const DenseMatrix& M,
+                             double hi) {
+    const int64_t n = K.rows();
+    if (n <= 0 || !(hi > 0.0)) return false;
+    double minShift = std::numeric_limits<double>::infinity();
+    double maxRowSumB = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        double rowSumA = 0.0, rowSumB = 0.0;
+        for (int64_t j = 0; j < n; ++j) {
+            if (j == i) continue;
+            const int64_t r = std::max(i, j), c = std::min(i, j);
+            rowSumA += std::abs(K(r, c));
+            rowSumB += std::abs(M(r, c));
+        }
+        minShift = std::min(minShift, K(i, i) - rowSumA);
+        maxRowSumB = std::max(maxRowSumB, M(i, i) + rowSumB);
+    }
+    if (!(minShift > 0.0) || !(maxRowSumB > 0.0)) return false;
+    return minShift / maxRowSumB > hi;
+}
+}  // namespace
+
+bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {    const auto& nd = tree_.node(nodeID);
     // 非叶：全部孩子的 KAccum/MAccum 必须完成（约化对角定稿）。
     for (int64_t child : nd.children) {
         if (!states_.isDone(child, NodeTaskKind::GaussKAccum) ||
@@ -138,6 +165,19 @@ bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {
 
     bool ok = false;
     DenseMatrix K, M;
+    // 分段剖析（AAMS_PROFILE）：loadBlocks 稠密化 / 区间求解 / 提交
+    static std::atomic<uint64_t> nsLoad{0}, nsSolve{0}, nsCommit{0};
+    struct SegDump {
+        ~SegDump() {
+            if (std::getenv("AAMS_PROFILE") == nullptr) return;
+            std::fprintf(stderr,
+                         "[prof] local-eig split: load=%.3fs solve=%.3fs "
+                         "commit=%.3fs\n",
+                         nsLoad.load() * 1e-9, nsSolve.load() * 1e-9,
+                         nsCommit.load() * 1e-9);
+        }
+    };
+    static SegDump segDump;
     // 就地重装载局部块。dsygvx 会破坏 A/B（B 变 Cholesky 因子、A 变标准化
     // 矩阵）：空区间回退 solveIndex 前必须重取原始块，否则对三角因子再做
     // 分解会得到 info=N+i 的假失败。
@@ -159,6 +199,7 @@ bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {
         return K.rows() > 0 && K.rows() == K.cols() && M.rows() == K.rows();
     };
     try {
+        const auto sl0 = std::chrono::steady_clock::now();
         ok = loadBlocks();
         if (ok && std::getenv("AMLS_DUMP_REDUCED_NODES") != nullptr) {
             // 诊断: 转储指定节点的约化对角块（AMLS_DUMP_REDUCED_NODES="656,2532"）
@@ -181,7 +222,13 @@ bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {
         }
         if (!ok)
             AMLS_LOG_ERROR("局部特征求解节点 {} 子块形状非法。", nodeID);
+        nsLoad.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<
+                                  std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - sl0).count()),
+            std::memory_order_relaxed);
         if (ok) {
+            const auto ss0 = std::chrono::steady_clock::now();
             Vector w;
             DenseMatrix V;
             const double lambdaHi =
@@ -190,15 +237,23 @@ bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {
                             cfg_.lambdaHiPerNode->size()
                     ? (*cfg_.lambdaHiPerNode)[static_cast<size_t>(nodeID)]
                     : cfg_.lambdaHi;
-            cfg_.dense->solveInterval(K, M, -1e300, lambdaHi, w, V);
-            if (w.size() == 0 && cfg_.minExtractOrder > 0) {
-                // 区间空回退：保留最低 minExtractOrder 阶（对齐 PKU
-                // allowZeroEigenPair=false 语义）。solveInterval 已就地
-                // 破坏 K/M，先重装载再解。
-                loadBlocks();
-                const int64_t keep =
-                    std::min<int64_t>(cfg_.minExtractOrder, K.rows());
+            if (intervalGuaranteedEmpty(K, M, lambdaHi)) {
+                // 区间必空（局部模态全高于 λhi）：直接保留最低
+                // minExtractOrder 阶，K/M 未被破坏，免重装载。
+                const int64_t keep = std::min<int64_t>(
+                    cfg_.minExtractOrder, K.rows());
                 cfg_.dense->solveIndex(K, M, 1, keep, w, V);
+            } else {
+                cfg_.dense->solveInterval(K, M, -1e300, lambdaHi, w, V);
+                if (w.size() == 0 && cfg_.minExtractOrder > 0) {
+                    // 区间空回退：保留最低 minExtractOrder 阶（对齐 PKU
+                    // allowZeroEigenPair=false 语义）。solveInterval 已就地
+                    // 破坏 K/M，先重装载再解。
+                    loadBlocks();
+                    const int64_t keep =
+                        std::min<int64_t>(cfg_.minExtractOrder, K.rows());
+                    cfg_.dense->solveIndex(K, M, 1, keep, w, V);
+                }
             }
             if (std::getenv("AMLS_DEBUG_KEPT"))
                 std::fprintf(stderr,
@@ -210,7 +265,18 @@ bool NodeTaskExecutor::runSolveLocalEigenPair(int64_t nodeID) {
                              static_cast<long long>(w.size()),
                              w.size() ? w[w.size() - 1] : -1.0);
             std::vector<double> vals(w.data(), w.data() + w.size());
+            nsSolve.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<
+                                      std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - ss0).count()),
+                std::memory_order_relaxed);
+            const auto sc0 = std::chrono::steady_clock::now();
             ok = saver_.setEigenPair(nodeID, std::move(vals), std::move(V));
+            nsCommit.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<
+                                      std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - sc0).count()),
+                std::memory_order_relaxed);
             if (!ok)
                 AMLS_LOG_ERROR("局部特征求解节点 {} 特征对提交失败。", nodeID);
         }

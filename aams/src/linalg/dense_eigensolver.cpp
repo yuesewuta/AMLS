@@ -1,12 +1,31 @@
 #include "linalg/dense_eigensolver.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include "linalg/lapack.h"
 
 namespace aams {
+
+// dsygvx 分段剖析（AAMS_PROFILE）：workspace 查询 / 实解。
+struct GvxProf {
+    std::atomic<uint64_t> qNs{0}, rNs{0}, qCalls{0}, rCalls{0};
+    static GvxProf& inst() {
+        static GvxProf p;
+        return p;
+    }
+    ~GvxProf() {
+        if (std::getenv("AAMS_PROFILE") == nullptr) return;
+        std::fprintf(stderr,
+                     "[prof] dsygvx: query=%.3fs (%llu) real=%.3fs (%llu)\n",
+                     qNs.load() * 1e-9, (unsigned long long)qCalls.load(),
+                     rNs.load() * 1e-9, (unsigned long long)rCalls.load());
+    }
+};
 
 template <typename T>
 void LapackDenseEigensolver<T>::solveAll(DenseMatrix& K, DenseMatrix& M,
@@ -67,17 +86,35 @@ void LapackDenseEigensolver<T>::solveInterval(DenseMatrix& K, DenseMatrix& M,
     double wkopt = 0;
     std::vector<int32_t> iwork(5 * static_cast<size_t>(n));
     std::vector<int32_t> ifail(static_cast<size_t>(n));
-    dsygvx_(&itype, &jobz, const_cast<char*>("V"), &uplo, &n, K.data(), &n,
-            M.data(), &n, &vl, &vu, &il, &iu, &abstol, &m, w.data(), Z.data(),
-            &n, &wkopt, &lwork, iwork.data(), ifail.data(), &info);
+    {
+        const auto tq0 = std::chrono::steady_clock::now();
+        dsygvx_(&itype, &jobz, const_cast<char*>("V"), &uplo, &n, K.data(), &n,
+                M.data(), &n, &vl, &vu, &il, &iu, &abstol, &m, w.data(), Z.data(),
+                &n, &wkopt, &lwork, iwork.data(), ifail.data(), &info);
+        auto& gp = GvxProf::inst();
+        gp.qNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<
+                                              std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - tq0).count()),
+                         std::memory_order_relaxed);
+        gp.qCalls.fetch_add(1, std::memory_order_relaxed);
+    }
     if (info != 0)
         throw std::runtime_error("dsygvx workspace 查询失败");
     lwork = static_cast<int32_t>(wkopt);
     std::vector<double> work(static_cast<size_t>(lwork));
 
-    dsygvx_(&itype, &jobz, const_cast<char*>("V"), &uplo, &n, K.data(), &n,
-            M.data(), &n, &vl, &vu, &il, &iu, &abstol, &m, w.data(), Z.data(),
-            &n, work.data(), &lwork, iwork.data(), ifail.data(), &info);
+    {
+        const auto tr0 = std::chrono::steady_clock::now();
+        dsygvx_(&itype, &jobz, const_cast<char*>("V"), &uplo, &n, K.data(), &n,
+                M.data(), &n, &vl, &vu, &il, &iu, &abstol, &m, w.data(), Z.data(),
+                &n, work.data(), &lwork, iwork.data(), ifail.data(), &info);
+        auto& gp = GvxProf::inst();
+        gp.rNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<
+                                              std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - tr0).count()),
+                         std::memory_order_relaxed);
+        gp.rCalls.fetch_add(1, std::memory_order_relaxed);
+    }
     if (info != 0)
         throw std::runtime_error("dsygvx 失败, info=" + std::to_string(info));
     if (m < 0 || m > n)
@@ -113,18 +150,36 @@ void LapackDenseEigensolver<T>::solveIndex(DenseMatrix& K, DenseMatrix& M,
     double wkopt = 0;
     std::vector<int32_t> iwork(5 * static_cast<size_t>(n));
     std::vector<int32_t> ifail(static_cast<size_t>(n));
-    dsygvx_(&itype, &jobz, const_cast<char*>("I"), &uplo, &n, K.data(), &n,
-            M.data(), &n, &vl, &vu, &il32, &iu32, &abstol, &m, w.data(),
-            Z.data(), &n, &wkopt, &lwork, iwork.data(), ifail.data(), &info);
+    {
+        const auto tq0 = std::chrono::steady_clock::now();
+        dsygvx_(&itype, &jobz, const_cast<char*>("I"), &uplo, &n, K.data(), &n,
+                M.data(), &n, &vl, &vu, &il32, &iu32, &abstol, &m, w.data(),
+                Z.data(), &n, &wkopt, &lwork, iwork.data(), ifail.data(), &info);
+        auto& gp = GvxProf::inst();
+        gp.qNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<
+                                              std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - tq0).count()),
+                         std::memory_order_relaxed);
+        gp.qCalls.fetch_add(1, std::memory_order_relaxed);
+    }
     if (info != 0)
         throw std::runtime_error("dsygvx workspace 查询失败");
     lwork = static_cast<int32_t>(wkopt);
     std::vector<double> work(static_cast<size_t>(lwork));
 
-    dsygvx_(&itype, &jobz, const_cast<char*>("I"), &uplo, &n, K.data(), &n,
-            M.data(), &n, &vl, &vu, &il32, &iu32, &abstol, &m, w.data(),
-            Z.data(), &n, work.data(), &lwork, iwork.data(), ifail.data(),
-            &info);
+    {
+        const auto tr0 = std::chrono::steady_clock::now();
+        dsygvx_(&itype, &jobz, const_cast<char*>("I"), &uplo, &n, K.data(), &n,
+                M.data(), &n, &vl, &vu, &il32, &iu32, &abstol, &m, w.data(),
+                Z.data(), &n, work.data(), &lwork, iwork.data(), ifail.data(),
+                &info);
+        auto& gp = GvxProf::inst();
+        gp.rNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<
+                                              std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - tr0).count()),
+                         std::memory_order_relaxed);
+        gp.rCalls.fetch_add(1, std::memory_order_relaxed);
+    }
     if (info != 0)
         throw std::runtime_error("dsygvx 失败, info=" + std::to_string(info));
     if (m < 0 || m > n)
