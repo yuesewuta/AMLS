@@ -150,11 +150,11 @@ feature-reaAMLS 分支，文档与代码同步提交。
 
 - cant_20：**达标**（≤2s 口径）。剩余路线（METIS 流水化、叶 dsyevr、
   结构级 frontal 重构）仅在追求与 Abaqus 同量级时立项。
-- cant_31：差距 ~12s（~1.6×）。瓶颈已定性：REDUCTION 依赖链在 4→16
-  线程几乎不加速（17.5→16.3s），O(depth²) 祖先对累积的链式依赖是
-  主因；METIS 4.1s 单线程成本开始可见。若目标扩展到此规模，优先
-  frontal 化（对标 Abaqus k_updext/stackext 的单次 dgemm 链结构）
-  与 METIS 流水化——这正是深挖文档 §5 收敛后的判断。
+- cant_31：**达标**（2026-10-18，详见 §7）。TOTAL best 20.66s vs
+  Abaqus ≈19.6s，差距 ~1.0–1.5s ≤ 2s；REDUCTION 依赖链本身的
+  算法级差距（AMLS 全 Ψ 累积 ~124 核秒 vs Abaqus 缩聚树 ~13.5
+  核秒）仍在，本轮靠并行化串行初始化链（解析/树/抽取/槽位）与
+  按需建槽补齐。若追求同量级，frontal 化仍是正道。
 - 内存：16G 机器当前配置可测 ~12–13 万 DOF（cant_31 峰值 6.21GB，
   ∝DOF^1.4）；瘦配置实测省不了（大头在 REDUCTION 稠密块）。
 
@@ -169,3 +169,75 @@ feature-reaAMLS 分支，文档与代码同步提交。
 | 蒸馏/Ritz | aams/src/ams/…（LAPACK 全后端） | 原则一 |
 | OriginalBlocks 抽取 | aams/src/ams/original_blocks.cpp（双线程+并行 finalize） | 原则五/Phase 3 |
 | 驱动与计时 | aams/src/ams/pams_driver.cpp | 插桩体系 |
+
+## 7. cant_31 专场（2026-10-18）：差距 ~12s → ~1.0–1.5s
+
+目标（用户）：cant_31 上 AAMS TOTAL 与 Abaqus AMS 差距缩小到 2 秒内
+（Abaqus 墙钟 ≈19.6s ⇒ 目标 TOTAL ≤ ~21.6s）。过程严格执行
+**REA 定位差异点 → REA 分析商软技术细节 → 改 AAMS → 验证**的迭代，
+不做无证据猜想。
+
+### 7.1 REA 证据基线
+
+- `bench_abaqus/cant_31.times`（ABA_PAMS_ 导出，4 线程）：每线程
+  12.86/12.86/19.55/19.55 核秒；m_stackext 16.6 核秒完美均衡、
+  局部特征（sygst/sytrd/stev/ormtr/trsm）~7.5、传播（k_updext 4.2 +
+  k_bwd_psi 4.1 + m_updext 5.2）全部摊进固定小队 ⇒ 高利用率。
+- AAMS REDUCTION 任务核时（8859 节点）：GaussMAccum 45.4 +
+  CompressUpdate 29.0 + GaussKAccum 28.9 + …≈ **124 核秒**，传播段
+  为 Abaqus 等效 ~13.5 核秒的 ~9×。这是 AMLS 全 Ψ 累积 vs Abaqus
+  子结构缩聚树（Craig-Bampton 静凝聚 + 缩聚局部特征）的**算法级
+  差距**，本轮明确不在会话内修（正面强攻 = frontal 化重构）。
+- DAG 尾段（最后 ~6s，利用率 ≈2/16）：近根 ~23–60 个任务串行链，
+  单任务 MAccum ~120ms（大量 <3ms 的 trans-suffix 批量 gemm）。
+
+### 7.2 本轮改动（全部残差逐位同验收）
+
+| 项 | 前 | 后 | 说明 |
+|---|---|---|---|
+| 矩阵解析（并行 parser） | K 4.5s | 0.37s | SMB 读 45s 需预热缓存后再计时 |
+| 纯符号分析 | treebuild 4.5s | 1.59s | 只算 fill1 不做数值 |
+| OriginalBlocks 抽取 | 1.47s | **0.50s** | pass1/pass2 按节点分线程 + 暂存合并（修耦合块双源写竞争）；**按需建槽**：count==0 的祖先对不建槽（K 块 555k→89k，消去模块走 findSub* nullptr→零初始化路径） |
+| gaussInit | 892ms | **433ms** | 2.2M Entry 并行预分配 + 串行 map 搬移；planColumns_ 按层级并行（lvl(j)=1+max(lvl(孩子))，同层节点依赖已就绪、槽位互不相交） |
+| TOTAL（cant_31） | 22.2s（best） | **20.66–21.06s** | 3 次 best-of-N，热缓存 |
+| TOTAL（cant_20 A/B） | — | 2.26–2.53s | 残差 0.5555962051/0.6026538919 逐位同 |
+
+### 7.3 负结果与教训（本轮新增）
+
+1. **预算单持有锁未释放**（本轮最大事故）：改 ScopedReservation
+   构造时把 `g_mtBudgetLock.clear()` 从析构删了 → 首个成功授予者
+   永久持锁，全部后续 dgemm 借贷死掉（parallel=1），colAcc gemm
+   50→151s、REDUCTION 16→33s。当时误判为"公平份额借贷灾难"，
+   靠跨 run 对比 [gemmcols]/[redclose] 计数器（contended 2085 vs
+   214）才定位。**改锁语义必须成对检查 acquire/release 路径。**
+2. **近根 m-循环借贷无净收益**：parallelAncLoop 借线程并行化在
+   cant_31 实测劣化（K/M 并发累积互饿 + helper 生成开销），公平
+   份额版（acquireLendFair）干净数据点为中性（16.36 vs 16.0s），
+   已回退为串行并删除死代码。Abaqus 的高利用率来自**操作内部**
+   固定小队并行，不是任务间借线程——AMLS 的 per-call 借贷粒度
+   太细，学不来。
+3. **Eigen 暂存槽必须显式定尺寸**：`unordered_map[key]` 默认构造
+   0×0 SparseMatrix 后 insert 越界 → 堆破坏 segfault（第一次并行
+   化的崩溃根因，非"节点划分错误"残余）。
+4. **串行初始化链是隐藏大头**：2.65s 的"解析+建树"里一半是
+   OriginalBlocks/gaussInit；AAMS_RED_CLOSE_LOG 分解（§4.4）再次
+   值回票价。ginit 拆分显示 slots 361ms / plan 531ms，对症下药。
+
+### 7.4 复现命令
+
+```bash
+# cant_31（热缓存 + 三连取 best）
+cat ../../bench_abaqus/cant_31_STIF2_free.mtx > /dev/null
+AAMS_PROFILE=1 AAMS_RED_CLOSE_LOG=1 ./aams_solve.exe \
+  --K ../../bench_abaqus/cant_31_STIF2_free.mtx \
+  --M ../../bench_abaqus/cant_31_MASS2_free.mtx \
+  --fmin 0 --fmax 120 --cutoff1 5 --reduced distill \
+  --subspace-max 1200 --threads 16
+# cant_20 对拍
+./aams_solve.exe --K ../../bench_abaqus/cant_20_K.mtx \
+  --M ../../bench_abaqus/cant_20_M.mtx --fmin 0 --fmax 120 \
+  --cutoff1 5 --reduced distill --threads 16 --subspace-max 1200
+```
+
+注意：stderr 必须重定向到本地盘（Z: 是 SMB，逐行日志会把运行
+拖成灾难）；机器后台负载可致 1.3–2× 膨胀，结论一律 best-of-N。

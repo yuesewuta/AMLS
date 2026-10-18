@@ -1,14 +1,38 @@
 #include "ams/gauss_module.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <iterator>
 #include <numeric>
 #include <stdexcept>
 #include <utility>
 
 #include "core/logging.hpp"
+#include "linalg/blas.hpp"
+#include "linalg/gemm_cols.hpp"
+#include "ams/node_task_executor.hpp"
 
 namespace aams {
+namespace {
+
+// parallelAncLoop 诊断计数（AAMS_RED_CLOSE_LOG 输出）。
+std::atomic<int64_t> ancLoopCalls{0};
+std::atomic<int64_t> ancLoopSerial{0};
+std::atomic<int64_t> ancLoopGranted{0};
+
+// 近根任务 m-循环并行（实验结论：借线程并行化在 cant_31 无净收益——
+// 尾段 4 个并发任务时 K/M 互借导致部分串行 + helper 生成/同步开销，
+// 实测 33s vs 串行 16s，已回退为串行。保留计数器与 [mtask] 打点。）
+thread_local int tl_ancThreads = 1;
+template <typename Fn>
+bool parallelAncLoop(size_t n, Fn body) {
+    tl_ancThreads = 1;
+    for (size_t m = 0; m < n; ++m)
+        if (!body(m)) return false;
+    return true;
+}
+
+}  // namespace
 
 GaussEliminationModule::Key GaussEliminationModule::reducedKey_(
     bool stiffness, int64_t i, int64_t j) const {
@@ -23,19 +47,21 @@ GaussEliminationModule::Entry* GaussEliminationModule::slot_(
     return it == slots_.end() ? nullptr : it->second.get();
 }
 
-const DefaultTraits::SparseMatrix& GaussEliminationModule::originalBlock_(
+const DefaultTraits::SparseMatrix* GaussEliminationModule::originalBlock_(
     bool stiffness, int64_t desc, int64_t anc) const {
     if (desc == anc)
-        return stiffness ? blocks_->diagK(desc) : blocks_->diagM(desc);
-    return stiffness ? blocks_->subK(desc, anc) : blocks_->subM(desc, anc);
+        return stiffness ? &blocks_->diagK(desc) : &blocks_->diagM(desc);
+    return stiffness ? blocks_->findSubK(desc, anc)
+                     : blocks_->findSubM(desc, anc);
 }
 
 std::vector<int64_t> GaussEliminationModule::originalColumns_(
     bool stiffness, int64_t desc, int64_t anc) const {
-    const SparseMatrix& src = originalBlock_(stiffness, desc, anc);
+    const SparseMatrix* src = originalBlock_(stiffness, desc, anc);
     std::vector<int64_t> cols;
-    for (int64_t c = 0; c < src.cols(); ++c)
-        if (src.outerIndexPtr()[c + 1] > src.outerIndexPtr()[c])
+    if (!src) return cols;  // 无结构耦合 → 零块
+    for (int64_t c = 0; c < src->cols(); ++c)
+        if (src->outerIndexPtr()[c + 1] > src->outerIndexPtr()[c])
             cols.push_back(c);
     return cols;
 }
@@ -51,9 +77,9 @@ bool GaussEliminationModule::ensureReduced_(bool stiffness, int64_t desc,
             stiffness ? "K" : "M", desc, anc);
         return false;
     }
-    const SparseMatrix& src = originalBlock_(stiffness, desc, anc);
-    if (src.nonZeros() == 0 && desc != anc) {
-        // 缺失耦合块：零初始化（布局内全为预留占位列）
+    const SparseMatrix* src = originalBlock_(stiffness, desc, anc);
+    if (!src || (src->nonZeros() == 0 && desc != anc)) {
+        // 缺失耦合块（无结构耦合，未建槽）：零初始化（布局内全为预留占位列）
         if (!out->initializeZero()) {
             AMLS_LOG_ERROR("ensureReduced 失败：{} 耦合块 ({},{}) 零初始化被拒。",
                            stiffness ? "K" : "M", desc, anc);
@@ -61,54 +87,91 @@ bool GaussEliminationModule::ensureReduced_(bool stiffness, int64_t desc,
         }
         return true;
     }
-    if (!out->initializeFromSparse(src)) {
+    if (!out->initializeFromSparse(*src)) {
         AMLS_LOG_ERROR(
             "ensureReduced 失败：{} 块 ({},{}) 从原始子块注入被拒 (块: {}x{}, "
             "validCols={}; src: {}x{})。",
             stiffness ? "K" : "M", desc, anc, out->rows(), out->totalCols(),
-            out->validCols(), src.rows(), src.cols());
+            out->validCols(), src->rows(), src->cols());
         return false;
     }
     return true;
 }
 
 bool GaussEliminationModule::initialize(const OriginalBlocks& blocks) {
+    const auto gstart = std::chrono::steady_clock::now();
     blocks_ = &blocks;
     tree_ = &blocks.tree();
     N_ = blocks.nNodes();
     useGemv_ = useColAccGemv();
 
     // 1. 槽位：K/M 对角 + 耦合 + Ψ/M_temp 方向槽位（运行期零 map 插入）。
-    //    先数准再 reserve，避免 rehash + unique_ptr 全量搬移。
+    //    分配（2.2M Entry）并行预构造，map 插入串行搬移 unique_ptr。
     int64_t sumAnc = 0;
     for (int64_t i = 0; i < N_; ++i)
         sumAnc += static_cast<int64_t>(tree_->ancestors(i).size());
     slots_.clear();
     slots_.reserve(static_cast<size_t>(N_ * 2 + 4 * sumAnc));
-    for (int64_t i = 0; i < N_; ++i) {
-        const int64_t ni = blocks.size(i);
-        for (bool stiffness : {true, false}) {
-            slots_[reducedKey_(stiffness, i, i)] =
-                std::make_unique<Entry>(ni, ni);
-        }
-        for (int64_t a : tree_->ancestors(i)) {
-            const int64_t na = blocks.size(a);
-            for (bool stiffness : {true, false}) {
-                slots_[reducedKey_(stiffness, i, a)] =
-                    std::make_unique<Entry>(ni, na);
+    std::vector<std::pair<Key, std::unique_ptr<Entry>>> staged;
+    staged.reserve(static_cast<size_t>(N_ * 2 + 4 * sumAnc));
+    std::vector<int64_t> off(static_cast<size_t>(N_ + 1), 0);
+    for (int64_t i = 0; i < N_; ++i)
+        off[static_cast<size_t>(i) + 1] =
+            off[static_cast<size_t>(i)] + 2 + 4 * static_cast<int64_t>(
+                                                   tree_->ancestors(i).size());
+    staged.resize(static_cast<size_t>(off[static_cast<size_t>(N_)]));
+    {
+        const int nthr = 8;
+        std::atomic<int64_t> next{0};
+        colcomp_detail::ThreadGroup tg(nthr - 1);
+        auto fill = [&] {
+            for (;;) {
+                const int64_t i = next.fetch_add(1);
+                if (i >= N_) break;
+                size_t p = static_cast<size_t>(off[static_cast<size_t>(i)]);
+                const int64_t ni = blocks.size(i);
+                for (bool stiffness : {true, false}) {
+                    staged[p++] = {reducedKey_(stiffness, i, i),
+                                   std::make_unique<Entry>(ni, ni)};
+                }
+                for (int64_t a : tree_->ancestors(i)) {
+                    const int64_t na = blocks.size(a);
+                    for (bool stiffness : {true, false}) {
+                        staged[p++] = {reducedKey_(stiffness, i, a),
+                                       std::make_unique<Entry>(ni, na)};
+                    }
+                    staged[p++] = {Key{Kind::Psi, i, a},
+                                   std::make_unique<Entry>()};
+                    staged[p++] = {Key{Kind::MTemp, i, a},
+                                   std::make_unique<Entry>()};
+                }
             }
-            slots_[Key{Kind::Psi, i, a}] = std::make_unique<Entry>();
-            slots_[Key{Kind::MTemp, i, a}] = std::make_unique<Entry>();
+        };
+        for (int t = 0; t < nthr; ++t) {
+            if (t == nthr - 1) fill();
+            else tg.start(fill);
         }
+        tg.wait();
     }
+    for (auto& [key, entry] : staged)
+        slots_.emplace(key, std::move(entry));
 
     // 2. 自底向上列规划。
+    const auto gsplit = std::chrono::steady_clock::now();
     if (!planColumns_()) {
         blocks_ = nullptr;
         tree_ = nullptr;
         slots_.clear();
         return false;
     }
+    if (std::getenv("AAMS_RED_CLOSE_LOG"))
+        std::fprintf(stderr, "[ginit] slots=%.1fms plan=%.1fms\n",
+                     std::chrono::duration<double, std::milli>(gsplit -
+                                                               gstart)
+                         .count(),
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - gsplit)
+                         .count());
     return true;
 }
 
@@ -120,22 +183,19 @@ bool GaussEliminationModule::planColumns_() {
         return cols;
     };
 
-    // 对角块：满列布局。
-    for (int64_t i : order) {
-        const std::vector<int64_t> full = fullColumns(blocks_->size(i));
+    // 单节点规划：对角满列 + 该节点全部祖先对的耦合布局。只读孩子的
+    // 布局（后序序中孩子先规划），节点间互不相交 → 按层级并行。
+    auto planNode = [&](int64_t j) -> bool {
+        const std::vector<int64_t> full = fullColumns(blocks_->size(j));
         for (bool stiffness : {true, false}) {
-            auto* diag = slot_(reducedKey_(stiffness, i, i));
+            auto* diag = slot_(reducedKey_(stiffness, j, j));
             if (!diag || !diag->matrix.setLayout(full)) {
-                AMLS_LOG_ERROR("planColumns 失败：{} 对角块 ({},{}) 缺失或布局被拒。",
-                               stiffness ? "K" : "M", i, i);
+                AMLS_LOG_ERROR(
+                    "planColumns 失败：{} 对角块 ({},{}) 缺失或布局被拒。",
+                    stiffness ? "K" : "M", j, j);
                 return false;
             }
         }
-    }
-
-    // 耦合块：rk = 原始 K(j,k) 列 ∪ 孩子 RK(c,k) 列；rm = 原始 M(j,k) 列 ∪
-    // 孩子 (RM∪RK)(c,k) 列。postOrder 保证孩子布局先行就绪。
-    for (int64_t j : order) {
         const std::vector<int64_t>& children = tree_->node(j).children;
         for (int64_t k : tree_->ancestors(j)) {
             const int64_t nk = blocks_->size(k);
@@ -160,7 +220,8 @@ bool GaussEliminationModule::planColumns_() {
                 kFull = static_cast<int64_t>(rk.size()) == nk;
             }
             auto* kjk = slot_(reducedKey_(true, j, k));
-            if (!kjk || !kjk->matrix.setLayout(kFull ? fullColumns(nk) : rk)) {
+            if (!kjk ||
+                !kjk->matrix.setLayout(kFull ? fullColumns(nk) : rk)) {
                 AMLS_LOG_ERROR(
                     "planColumns 失败：K 耦合块 ({},{}) 缺失或布局被拒 ({} 列, "
                     "n_k={})。",
@@ -191,7 +252,8 @@ bool GaussEliminationModule::planColumns_() {
                 mFull = static_cast<int64_t>(rm.size()) == nk;
             }
             auto* mjk = slot_(reducedKey_(false, j, k));
-            if (!mjk || !mjk->matrix.setLayout(mFull ? fullColumns(nk) : rm)) {
+            if (!mjk ||
+                !mjk->matrix.setLayout(mFull ? fullColumns(nk) : rm)) {
                 AMLS_LOG_ERROR(
                     "planColumns 失败：M 耦合块 ({},{}) 缺失或布局被拒 ({} 列, "
                     "n_k={})。",
@@ -199,6 +261,51 @@ bool GaussEliminationModule::planColumns_() {
                 return false;
             }
         }
+        return true;
+    };
+
+    // 层级划分：lvl(j) = 1 + max(lvl(孩子))。同层节点依赖已全部就绪。
+    std::vector<int> lvl(static_cast<size_t>(N_), 0);
+    int maxLvl = 0;
+    for (int64_t j : order) {
+        int l = 0;
+        for (int64_t c : tree_->node(j).children)
+            l = std::max(l, lvl[static_cast<size_t>(c)] + 1);
+        lvl[static_cast<size_t>(j)] = l;
+        maxLvl = std::max(maxLvl, l);
+    }
+    std::vector<std::vector<int64_t>> byLvl(
+        static_cast<size_t>(maxLvl + 1));
+    for (int64_t j : order)
+        byLvl[static_cast<size_t>(lvl[static_cast<size_t>(j)])].push_back(j);
+
+    const int nthr = 8;
+    for (auto& bucket : byLvl) {
+        if (bucket.empty()) continue;
+        if (nthr <= 1 || bucket.size() < 4) {
+            for (int64_t j : bucket)
+                if (!planNode(j)) return false;
+            continue;
+        }
+        std::atomic<size_t> next{0};
+        std::atomic<bool> fail{false};
+        colcomp_detail::ThreadGroup tg(static_cast<size_t>(nthr - 1));
+        auto work = [&] {
+            for (;;) {
+                const size_t i = next.fetch_add(1);
+                if (i >= bucket.size() ||
+                    fail.load(std::memory_order_relaxed))
+                    break;
+                if (!planNode(bucket[i]))
+                    fail.store(true, std::memory_order_relaxed);
+            }
+        };
+        for (int t = 0; t < nthr; ++t) {
+            if (t == nthr - 1) work();
+            else tg.start(work);
+        }
+        tg.wait();
+        if (fail.load(std::memory_order_relaxed)) return false;
     }
     return true;
 }
@@ -294,7 +401,7 @@ bool GaussEliminationModule::accumulateReducedStiffness(int64_t nodeI) {
             !opsTransBuildRightEnd(sources.front()->rows(), sources, re))
             return false;
     }
-    for (size_t m = 0; m < anc.size(); ++m) {
+    const bool okAll = parallelAncLoop(anc.size(), [&](size_t m) -> bool {
         const int64_t j = anc[m];
         const auto* psi = getPsi(nodeI, j);
         // 固定 (nodeI, j)：全部 k≥j 的目标块一次批量更新。
@@ -347,8 +454,9 @@ bool GaussEliminationModule::accumulateReducedStiffness(int64_t nodeI) {
                 j, nodeI, j, nodeI);
             return false;
         }
-    }
-    return true;
+        return true;
+    });
+    return okAll;
 }
 
 bool GaussEliminationModule::computeMtemp(int64_t nodeI) {
@@ -402,6 +510,9 @@ bool GaussEliminationModule::computeMtemp(int64_t nodeI) {
 }
 
 bool GaussEliminationModule::accumulateReducedMass(int64_t nodeI) {
+    namespace chrono = std::chrono;
+    static const bool profTask = std::getenv("AAMS_PROFILE") != nullptr;
+    const auto taskT0 = chrono::steady_clock::now();
     const std::vector<int64_t> anc = tree_->ancestors(nodeI);
     for (int64_t j : anc) {
         const auto* psiJ = getPsi(nodeI, j);
@@ -451,7 +562,10 @@ bool GaussEliminationModule::accumulateReducedMass(int64_t nodeI) {
                 return false;
         }
     }
-    for (size_t m = 0; m < anc.size(); ++m) {
+    const auto reT = chrono::steady_clock::now();
+    std::atomic<uint64_t> ensureNs{0}, opsNs{0};
+    const bool okAll = parallelAncLoop(anc.size(), [&](size_t m) -> bool {
+        const auto mT0 = chrono::steady_clock::now();
         const int64_t j = anc[m];
         const auto* psiJ = getPsi(nodeI, j);
         const auto* mtemp = getMTemp(nodeI, j);
@@ -504,6 +618,12 @@ bool GaussEliminationModule::accumulateReducedMass(int64_t nodeI) {
             }
             mtxs.push_back(&targetEntry->mtx);
         }
+        const auto tOps0 = chrono::steady_clock::now();
+        ensureNs.fetch_add(
+            static_cast<uint64_t>(
+                chrono::duration_cast<chrono::nanoseconds>(tOps0 - mT0)
+                    .count()),
+            std::memory_order_relaxed);
         const bool ok = noSuffix
                             ? opsColAccBatchTrans(*psiJ, src1, targets, mtxs) &&
                                   opsColAccBatchTrans(*mtemp, src2, targets, mtxs)
@@ -513,6 +633,12 @@ bool GaussEliminationModule::accumulateReducedMass(int64_t nodeI) {
                                   opsColAccBatchTransSuffix(*mtemp, re2,
                                                             static_cast<int64_t>(m),
                                                             targets, mtxs);
+        opsNs.fetch_add(
+            static_cast<uint64_t>(
+                chrono::duration_cast<chrono::nanoseconds>(
+                    chrono::steady_clock::now() - tOps0)
+                    .count()),
+            std::memory_order_relaxed);
         if (!ok) {
             AMLS_LOG_ERROR(
                 "accumulateReducedMass 失败：M̃ (j,·) += Ψ ({},{})ᵀ·M̃ + "
@@ -520,8 +646,29 @@ bool GaussEliminationModule::accumulateReducedMass(int64_t nodeI) {
                 nodeI, j, nodeI, j);
             return false;
         }
+        return true;
+    });
+    if (profTask) {
+        const uint64_t total = static_cast<uint64_t>(
+            chrono::duration_cast<chrono::nanoseconds>(
+                chrono::steady_clock::now() - taskT0)
+                .count());
+        if (total > 20000000)
+            std::fprintf(stderr,
+                         "[mtask] node=%lld anc=%zu thr=%d busy=%d lent=%d "
+                         "size=%d total=%.1fms "
+                         "rightEnd=%.1fms ensure=%.1fms ops=%.1fms\n",
+                         (long long)nodeI, anc.size(), tl_ancThreads,
+                         tl_lastGateBusy, tl_lastGateLent, tl_lastGateSize,
+                         total / 1e6,
+                         chrono::duration_cast<chrono::nanoseconds>(reT -
+                                                                    taskT0)
+                                 .count() /
+                             1e6,
+                         ensureNs.load(std::memory_order_relaxed) / 1e6,
+                         opsNs.load(std::memory_order_relaxed) / 1e6);
     }
-    return true;
+    return okAll;
 }
 
 const DefaultTraits::DenseMatrix* GaussEliminationModule::getReducedDiagK(
@@ -599,6 +746,14 @@ const std::vector<int32_t>* GaussEliminationModule::getReservedColState(
         return nullptr;
     }
     return &entry->matrix.colState();
+}
+
+void reportAncLoopStats() {
+    std::fprintf(stderr,
+                 "[redclose] ancLoop calls=%lld serial=%lld grantedSum=%lld\n",
+                 (long long)ancLoopCalls.load(std::memory_order_relaxed),
+                 (long long)ancLoopSerial.load(std::memory_order_relaxed),
+                 (long long)ancLoopGranted.load(std::memory_order_relaxed));
 }
 
 } // namespace aams

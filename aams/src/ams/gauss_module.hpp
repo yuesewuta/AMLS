@@ -117,7 +117,8 @@ private:
     /// 耦合块零初始化）。desc 为行（后代）节点、anc 为列（祖先）节点。
     bool ensureReduced_(bool stiffness, int64_t desc, int64_t anc,
                         Entry& entry, ColCompMat*& out);
-    const SparseMatrix& originalBlock_(bool stiffness, int64_t desc,
+    /// 原始稀疏块（desc 行、anc 列）；无结构耦合的祖先对返回 nullptr。
+    const SparseMatrix* originalBlock_(bool stiffness, int64_t desc,
                                        int64_t anc) const;
     /// 原始稀疏块的实际非零列（缺失耦合块视为零块 → 空列表）。
     std::vector<int64_t> originalColumns_(bool stiffness, int64_t desc,
@@ -140,5 +141,9 @@ private:
     bool useGemv_ = true;
     std::unordered_map<Key, std::unique_ptr<Entry>, KeyHash> slots_;
 };
+
+/// parallelAncLoop 诊断计数（AAMS_RED_CLOSE_LOG 时输出）：
+/// calls / 串行退化次数 / 累计授予线程数。
+void reportAncLoopStats();
 
 } // namespace aams

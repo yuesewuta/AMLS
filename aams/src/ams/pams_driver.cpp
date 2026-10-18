@@ -32,6 +32,7 @@
 #include "core/trace.hpp"
 #include "linalg/blas.hpp"
 #include "linalg/col_ops.hpp"
+#include "linalg/gemm_cols.hpp"
 #include "linalg/colcomp_mat.hpp"
 #include "linalg/dense_eigensolver.hpp"
 
@@ -193,13 +194,29 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
     ropt.aggregateLeaves = opt.aggregateLeaves;
     ropt.dofsPerNode = opt.dofsPerNode;
     ropt.superRootDofs = n;   // 多根森林合成空 DOF 超根（单根约定）
-    auto part = rea::buildAbaqusTree(KM.K + KM.M, ropt);
+    const bool profLog = std::getenv("AAMS_PROFILE") != nullptr;
+    auto tpTree = Clock::now();
+    const auto tkm = Clock::now();
+    DefaultTraits::SparseMatrix kmSum = KM.K + KM.M;
+    if (std::getenv("AAMS_PROFILE"))
+        std::fprintf(stderr, "[prof] tree K+Madd=%.2fs\n",
+                     seconds(tkm, Clock::now()));
+    auto part = rea::buildAbaqusTree(kmSum, ropt);
+    const double treeSec =
+        std::chrono::duration<double>(Clock::now() - tpTree).count();
+    auto tpPerm = Clock::now();
     SeparatorTree tree =
         renumberPostOrder(remapTreeToReordered(part.tree, part.perm));
     const int64_t nTreeNodes = tree.nNodes();
     Pencil<DefaultTraits> reordered;
     reordered.K = permuteSymmetric(KM.K, part.perm);
     reordered.M = permuteSymmetric(KM.M, part.perm);
+    const double permSec =
+        std::chrono::duration<double>(Clock::now() - tpPerm).count();
+    if (profLog)
+        std::cerr << "[prof] treebuild=" << treeSec << "s permute="
+                  << permSec << "s\n"
+                  << std::flush;
     sol.timing["METIS_ORDERING_BUILD_TREE"] = seconds(t0, Clock::now());
 
     // ---- [9] Reduction Phase：局部特征 + 约束模态 Ψ + 缩聚 ----
@@ -285,9 +302,37 @@ AmsSolver::Solution AmsSolver::solve(const Pencil<DefaultTraits>& KM,
         if (!exec.runNodeOrder(nodePool, branchPool))
             throw std::runtime_error("Reduction Phase 失败（详见日志）");
         const auto tp2 = Clock::now();
-        if (redCloseLog)
+        if (redCloseLog) {
             std::fprintf(stderr, "[redclose] poolCtor=%.1fms runOrder=%.1fms\n",
                          seconds(tp0, tp1) * 1e3, seconds(tp1, tp2) * 1e3);
+            std::fprintf(stderr,
+                         "[redclose] budget hungry=%lld granted=%lld "
+                         "contended=%lld\n",
+                         (long long)blas::ScopedReservation::nHungry.load(
+                             std::memory_order_relaxed),
+                         (long long)blas::ScopedReservation::nBudgetGranted
+                             .load(std::memory_order_relaxed),
+                         (long long)blas::ScopedReservation::nBudgetContended
+                             .load(std::memory_order_relaxed));
+            std::fprintf(stderr,
+                         "[redclose] budget noTls=%lld nested=%lld "
+                         "gate=%lld\n",
+                         (long long)blas::ScopedReservation::nNoTls.load(
+                             std::memory_order_relaxed),
+                         (long long)blas::ScopedReservation::nNest.load(
+                             std::memory_order_relaxed),
+                         (long long)blas::ScopedReservation::nGate.load(
+                             std::memory_order_relaxed));
+            std::fprintf(stderr,
+                         "[redclose] ancGate nodePool rejects=%lld busyMax=%d "
+                         "branchPool rejects=%lld busyMax=%d\n",
+                         (long long)nodePool.gateRejects(),
+                         nodePool.gateBusyMax(),
+                         (long long)branchPool.gateRejects(),
+                         branchPool.gateBusyMax());
+            GemmColsStats::report();
+            reportAncLoopStats();
+        }
     }
     sol.timing["REDUCTION"] = seconds(t1, Clock::now());
     colOpsDumpStats();

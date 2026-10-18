@@ -122,14 +122,26 @@ int main(int argc, char** argv) {
                 std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
 
         aams::Pencil<aams::DefaultTraits> km;
+        const bool prof = std::getenv("AAMS_PROFILE") != nullptr;
+        auto clockNow = [] { return std::chrono::steady_clock::now(); };
+        auto tp = clockNow();
         km.K = aams::readMatrixMarket<aams::DefaultTraits>(a.kFile);
+        const double parseK =
+            std::chrono::duration<double>(clockNow() - tp).count();
+        double parseM = 0.0;
         if (!a.mFile.empty()) {
+            tp = clockNow();
             km.M = aams::readMatrixMarket<aams::DefaultTraits>(a.mFile);
+            parseM = std::chrono::duration<double>(clockNow() - tp).count();
         } else {
             km.M.resize(km.K.rows(), km.K.cols());
             km.M.setIdentity();
             std::cerr << "[aams_solve] 未提供 M，使用单位阵\n";
         }
+        if (prof)
+            std::cerr << "[prof] parse K=" << parseK << "s M=" << parseM
+                      << "s\n"
+                      << std::flush;
 
         aams::AmsSolver solver;
         aams::AmsSolver::Solution sol = solver.solve(km, a.opt);

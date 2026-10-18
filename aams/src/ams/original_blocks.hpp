@@ -11,7 +11,8 @@
 //     索引列表中的位置（构造时排序固化）。
 //   - subK(i,a) 为 n_i × n_a（行 = i 空间、列 = a 空间）；K 对称下
 //     subK(i,a)ᵀ = K(a 空间 × i 空间)。
-//   - 无结构耦合的 (i,a) 对返回形状正确的空矩阵。
+//   - 无结构耦合的 (i,a) 对不建槽：findSubK/findSubM 返回 nullptr；
+//     subK/subM 仅对有结构耦合的 pair 可用（缺失抛 std::out_of_range）。
 //   - 不可比（互非祖先）节点对之间出现耦合 → 结构非法，构造抛
 //     std::invalid_argument（分隔树性质：子树间只经共同祖先耦合）。
 #include <cstdint>
@@ -42,12 +43,16 @@ public:
     const SparseMatrix& diagK(int64_t i) const;
     const SparseMatrix& diagM(int64_t i) const;
     /// (i,a) 耦合子块：i 为后代、a 为其祖先（n_i × n_a）。
-    /// a 不是 i 的祖先时抛 std::out_of_range。
+    /// a 不是 i 的祖先时抛 std::out_of_range；无结构耦合（未建槽）也抛，
+    /// 需判存在性时用 findSubK/findSubM。
     const SparseMatrix& subK(int64_t i, int64_t a) const;
     const SparseMatrix& subM(int64_t i, int64_t a) const;
+    /// 同 subK/subM，但无结构耦合返回 nullptr（不建槽）。
+    const SparseMatrix* findSubK(int64_t i, int64_t a) const;
+    const SparseMatrix* findSubM(int64_t i, int64_t a) const;
     bool hasCouplingK(int64_t i, int64_t a) const;
     bool hasCouplingM(int64_t i, int64_t a) const;
-    /// 全部 (i, 祖先) 对数（诊断）。
+    /// 有结构耦合的 (i, 祖先) 对数（诊断）。
     int64_t nCouplingPairs() const { return nPairs_; }
 
 private:

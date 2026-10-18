@@ -11,6 +11,10 @@
 
 namespace aams {
 
+thread_local int tl_lastGateBusy = 0;
+thread_local int tl_lastGateLent = 0;
+thread_local int tl_lastGateSize = 0;
+
 namespace {
 
 using DenseMatrix = DefaultTraits::DenseMatrix;
@@ -423,6 +427,26 @@ void NodeTaskExecutor::execDagTask(const std::shared_ptr<void>& ctxVoid,
         const int run =
             std::max(1, dag->inFlight.load(std::memory_order_relaxed));
         opsTlsThreads() = std::max(1, std::min(cap, cap / run));
+    }
+    // 安装 ScopedReservation 的池借还回调（每 worker 一次）：洪泛期
+    // 池忙 → 借不到 → 大 gemm 串行（与 cant_20 负结果一致）；链尾池空
+    // → 借满整池。闭包只在 worker 自身线程上调用，worker 随池销毁，
+    // 无悬垂。
+    {
+        static thread_local bool tlsBudgetInstalled = false;
+        if (!tlsBudgetInstalled && dag->pool) {
+            ThreadPool* pool = dag->pool;
+            blas::tls_availableThreads = [pool]() {
+                return pool->availableLend();
+            };
+            blas::tls_acquireThreads = [pool](int k) {
+                return pool->acquireLend(k);
+            };
+            blas::tls_releaseThreads = [pool](int n) {
+                pool->releaseLend(n);
+            };
+            tlsBudgetInstalled = true;
+        }
     }
 
     bool ok = false;

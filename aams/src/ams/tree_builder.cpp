@@ -1,6 +1,7 @@
 #include "ams/tree_builder.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -133,6 +134,14 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
     const int64_t n = A.rows();
     Result res;
     if (n == 0) return res;
+    const bool prof = std::getenv("AAMS_PROFILE") != nullptr;
+    auto clockNow = [] { return std::chrono::steady_clock::now(); };
+    auto profMark = [&](const char* what, std::chrono::steady_clock::time_point t0) {
+        if (prof)
+            std::fprintf(stderr, "[prof] tree %s=%.2fs\n", what,
+                         std::chrono::duration<double>(clockNow() - t0).count());
+    };
+    auto ts = clockNow();
 
     // ---- 1. 网格节点图收缩 + METIS_NodeND 排列（GenerateOrder ↣ NodeND）----
     // Abaqus 在网格节点图上跑 NodeND（stf 块以 3-DOF 为主），DOF 排列 =
@@ -150,7 +159,10 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
             " 布局校验失败（n 不整除或组内 dofs 未两两耦合）");
     }
     const int64_t nv = dp > 1 ? n / dp : n;
+    profMark("detect", ts);
     Csr g = dp > 1 ? extractNodeGraph(A, dp, nv) : extractGraph(A);
+    auto te = clockNow();
+    profMark("extract", te);
     idx_t nvtxs = static_cast<idx_t>(nv);
     std::vector<idx_t> mperm(static_cast<size_t>(nv)), iperm(static_cast<size_t>(nv));
     idx_t opts[METIS_NOPTIONS];
@@ -160,6 +172,7 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
                                nullptr, opts, mperm.data(), iperm.data());
     if (r != METIS_OK)
         throw std::runtime_error("rea::buildAbaqusTree: METIS_NodeND 失败");
+    profMark("metis", clockNow());
     std::vector<int64_t> permND(static_cast<size_t>(n));
     if (dp > 1) {
         for (int64_t pos = 0; pos < nv; ++pos)
@@ -178,14 +191,20 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
     // 3:6739/6:1033/9:70/12:48/18:5/24:3，全为 3 的倍数）一致。若在 dof
     // 层做消除分析，导出 mtx 丢失的组内耦合会让三重奏被 exact 检测拆开。
     sym::SymbolicAnalysis sa;
+    auto t2 = clockNow();
+    auto t2a = t2;
     if (dp > 1) {
         std::vector<Eigen::Triplet<double>> trips;
         trips.reserve(static_cast<size_t>(A.nonZeros()));
         for (int64_t c = 0; c < n; ++c)
             for (DefaultTraits::SparseMatrix::InnerIterator it(A, c); it; ++it)
                 trips.emplace_back(it.row() / dp, c / dp, it.value());
+        profMark("step2-trips", t2a);
+        t2a = clockNow();
         DefaultTraits::SparseMatrix An(nv, nv);
         An.setFromTriplets(trips.begin(), trips.end());
+        profMark("step2-sft", t2a);
+        t2a = clockNow();
         std::vector<int64_t> nodePerm(static_cast<size_t>(nv));
         for (int64_t v = 0; v < nv; ++v)
             nodePerm[static_cast<size_t>(v)] = mperm[static_cast<size_t>(v)];
@@ -202,6 +221,8 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
     if (std::getenv("AMLS_DUMP_TREE"))
         std::fprintf(stderr, "[rea-tree] step2 done etree size=%lld\n",
                      (long long)sa.parentColumn.size());
+    profMark("step2-analyze", t2);
+    auto t3 = clockNow();
 
     // ---- 3. exact 基础超节点（CreateFundamentalSuperNodes ↣ buildBlockForest）----
     if (std::getenv("AMLS_DUMP_TREE"))
@@ -240,6 +261,8 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
     if (std::getenv("AMLS_DUMP_TREE"))
         std::fprintf(stderr, "[rea-tree] step4 aggregate\n");
     sym::BlockForest forest = sym::aggregateAbaqusStyle(base, ap);
+    profMark("step3+4-blocks", t3);
+    auto t5 = clockNow();
     if (std::getenv("AMLS_DUMP_TREE"))
         sym::dumpAggregationStats(forest, "aggregated");
 
@@ -331,6 +354,7 @@ IPartitioner<DefaultTraits>::Result buildAbaqusTree(
         std::fprintf(stderr, "[rea-tree] K全边不可比计数=%lld\n",
                      (long long)nBad);
     }
+    profMark("step5-7-tree", t5);
     return res;
 }
 

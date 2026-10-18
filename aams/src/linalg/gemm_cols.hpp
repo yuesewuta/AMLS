@@ -8,6 +8,7 @@
 //   * 算子层并行度 opsTlsThreads() 为 thread_local：大乘法入口按执行器
 //     当前空闲容量刷新，不在 worker 里的调用保持串行。
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -73,6 +74,27 @@ private:
 
 } // namespace colcomp_detail
 
+/// 剖析计数（AAMS_PROFILE=1 时在 REDUCTION 收尾打印）。
+struct GemmColsStats {
+    static inline std::atomic<int64_t> calls{0};
+    static inline std::atomic<int64_t> smallFlops{0};
+    static inline std::atomic<int64_t> fewCols{0};
+    static inline std::atomic<int64_t> noGrant{0};
+    static inline std::atomic<int64_t> parallel{0};
+    static inline std::atomic<int64_t> helperThreads{0};
+    static inline void report() {
+        std::fprintf(stderr,
+                     "[gemmcols] calls=%lld smallFlops=%lld fewCols=%lld "
+                     "noGrant=%lld parallel=%lld helperThreads=%lld\n",
+                     (long long)calls.load(std::memory_order_relaxed),
+                     (long long)smallFlops.load(std::memory_order_relaxed),
+                     (long long)fewCols.load(std::memory_order_relaxed),
+                     (long long)noGrant.load(std::memory_order_relaxed),
+                     (long long)parallel.load(std::memory_order_relaxed),
+                     (long long)helperThreads.load(std::memory_order_relaxed));
+    }
+};
+
 /// 原始指针列分组并行 dgemm（tb=CblasNoTrans 专用）：
 /// C(:, jseg) = alpha·op(A)·op(B)(:, jseg) + beta·C(:,jseg)。
 inline void dgemmColsRaw(CBLAS_TRANSPOSE ta, int m, int n, int k,
@@ -80,25 +102,38 @@ inline void dgemmColsRaw(CBLAS_TRANSPOSE ta, int m, int n, int k,
                          const double* B, int ldb, double beta, double* C,
                          int ldc, int nthreads) {
     if (n <= 0 || m <= 0) return;
+    GemmColsStats::calls.fetch_add(1, std::memory_order_relaxed);
     static const bool forceSerial = std::getenv("AMLS_DGEMM_SERIAL") != nullptr;
     if (forceSerial) nthreads = 1;
     // 小乘法直接串行：ThreadGroup 每次 spawn/join/pin 的固定开销 ms 级，
     // 而关键链上大量小调用（如 1×3×66）的 flops 只有 µs 级，分段并行
     // 净亏千倍（cant_20 时间线实测：链节点 ~29 次批量 × ~7ms 线程开销）。
     if (2.0 * static_cast<double>(m) * n * k < 3e7) {
+        GemmColsStats::smallFlops.fetch_add(1, std::memory_order_relaxed);
         cblas_dgemm(CblasColMajor, ta, CblasNoTrans, m, n, k, alpha, A, lda,
                     B, ldb, beta, C, ldc);
         return;
     }
-    nthreads = std::min<int>(nthreads, (n + 31) / 32);
+    const int capped = std::min<int>(nthreads, (n + 31) / 32);
+    if (capped <= 1) {
+        GemmColsStats::fewCols.fetch_add(1, std::memory_order_relaxed);
+        cblas_dgemm(CblasColMajor, ta, CblasNoTrans, m, n, k, alpha, A, lda,
+                    B, ldb, beta, C, ldc);
+        return;
+    }
+    nthreads = capped;
     // 手工列分块与 BLAS 预算共用容量：借不到（队列忙/互斥被占）就串行。
     blas::ScopedReservation reserve(nthreads);
     nthreads = reserve.threads;
     if (nthreads <= 1) {
+        GemmColsStats::noGrant.fetch_add(1, std::memory_order_relaxed);
         cblas_dgemm(CblasColMajor, ta, CblasNoTrans, m, n, k, alpha, A, lda,
                     B, ldb, beta, C, ldc);
         return;
     }
+    GemmColsStats::parallel.fetch_add(1, std::memory_order_relaxed);
+    GemmColsStats::helperThreads.fetch_add(nthreads - 1,
+                                           std::memory_order_relaxed);
     auto runSeg = [&](int j0, int j1) {
         if (j1 <= j0) return;
         const int jn = j1 - j0;
@@ -119,7 +154,7 @@ inline void dgemmColsRaw(CBLAS_TRANSPOSE ta, int m, int n, int k,
         if (t == nthreads - 1)
             runSeg(j0, j1);
         else
-            helper.start([&] { runSeg(j0, j1); });
+            helper.start([runSeg, j0, j1] { runSeg(j0, j1); });
     }
     helper.wait();
 }
@@ -190,7 +225,7 @@ inline void dgemmCols(CBLAS_TRANSPOSE ta, CBLAS_TRANSPOSE tb, double alpha,
         if (t == nthreads - 1)
             runSeg(j0, j1);
         else
-            helper.start([&] { runSeg(j0, j1); });
+            helper.start([runSeg, j0, j1] { runSeg(j0, j1); });
     }
     helper.wait();
     (void)sizeof(Dense);

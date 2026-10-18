@@ -82,6 +82,8 @@ extern thread_local bool tls_starved;
 extern thread_local bool tls_budgetActive;
 extern thread_local std::function<int()> tls_availableThreads;
 extern thread_local std::function<int(int)> tls_acquireThreads;
+// 粗粒度借贷专用（parallelAncLoop 等一次并行化大批操作的调用方）：
+// 无单持有锁、公平份额授予；归还仍走 tls_releaseThreads。
 extern thread_local std::function<void(int)> tls_releaseThreads;
 extern std::atomic_flag g_mtBudgetLock;
 
@@ -102,12 +104,22 @@ struct ScopedReservation {
     static inline std::atomic<int64_t> nBudgetGranted{0};
     static inline std::atomic<int64_t> nBudgetContended{0};
     static inline std::atomic<int64_t> nHungry{0};
+    // 退化原因诊断（AAMS_RED_CLOSE_LOG）。
+    static inline std::atomic<int64_t> nNoTls{0};
+    static inline std::atomic<int64_t> nNest{0};
+    static inline std::atomic<int64_t> nGate{0};
 
     explicit ScopedReservation(int k) {
-        if (std::getenv("AMLS_NO_MT") || !adaptationEnabled() ||
-            tls_budgetActive || k <= 1 || !tls_acquireThreads ||
-            !tls_releaseThreads)
+        if (std::getenv("AMLS_NO_MT") || !adaptationEnabled() || k <= 1)
             return;
+        if (!tls_acquireThreads || !tls_releaseThreads) {
+            nNoTls.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (tls_budgetActive) {
+            nNest.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         // 先复制归还回调，避免登记容量后 std::function 分配失败漏还。
         release_ = tls_releaseThreads;
         nHungry.fetch_add(1, std::memory_order_relaxed);
@@ -116,6 +128,8 @@ struct ScopedReservation {
             return;
         }
         // 锁顺序只有预算 try_lock → DAG qm；qm 持有者从不获取预算锁。
+        // 单持有锁限制 per-call 级借贷的并发（每个小 gemm 单独借贷会引发
+        // 线程生成风暴，cant_31 实测 colAcc gemm 3 倍劣化）。
         try {
             threads = tls_acquireThreads(k);
         } catch (...) {
@@ -124,6 +138,7 @@ struct ScopedReservation {
         }
         if (threads <= 1) {
             threads = 1;
+            nGate.fetch_add(1, std::memory_order_relaxed);
             g_mtBudgetLock.clear(std::memory_order_release);
             return;
         }

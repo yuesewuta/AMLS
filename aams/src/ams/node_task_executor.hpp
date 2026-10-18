@@ -51,13 +51,20 @@ namespace aams {
 /// enqueue 的 priority 越小越先执行（0 = 最高）：REDUCTION 关键链靠近
 /// 根的节点若按 FIFO 排在叶洪流之后，关键路径会被排队延迟主导
 /// （cant_20 时间线实测：链上小节点任务共 ~4ms 却贡献 ~140ms）。
+// acquireLend 最近一次见到的 busy（诊断用，AAMS_PROFILE [mtask] 打印）。
+extern thread_local int tl_lastGateBusy;
+extern thread_local int tl_lastGateLent;
+extern thread_local int tl_lastGateSize;
+
 class ThreadPool {
 public:
-    explicit ThreadPool(int numThreads) {
+    explicit ThreadPool(int numThreads,
+                        std::function<void()> workerInit = nullptr) {
         for (int t = 0; t < numThreads; ++t)
-            workers_.emplace_back([this, t]() {
+            workers_.emplace_back([this, t, workerInit]() {
                 blas::pinThisThread();  // BLAS 并行度钉 1（BLAS 全局单线程，
                                         // 见 solver 编排；钉线程防库内逃逸）
+                if (workerInit) workerInit();
                 for (;;) {
                     std::function<void(int)> task;
                     {
@@ -70,7 +77,10 @@ public:
                             const_cast<PrioritizedTask&>(tasks_.top()).task);
                         tasks_.pop();
                     }
+                    pending_.fetch_sub(1, std::memory_order_relaxed);
+                    running_.fetch_add(1, std::memory_order_relaxed);
                     task(t);
+                    running_.fetch_sub(1, std::memory_order_relaxed);
                 }
             });
     }
@@ -90,10 +100,57 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             tasks_.push({std::move(f), priority, ++seq_});
         }
+        pending_.fetch_add(1, std::memory_order_relaxed);
         cv_.notify_one();
     }
 
     int size() const { return static_cast<int>(workers_.size()); }
+
+    /// 当前可借线程数（近似，无锁）：池大小 − 运行中 − 排队 − 已借出。
+    int availableLend() const {
+        return std::max(0,
+                        static_cast<int>(workers_.size()) -
+                            running_.load(std::memory_order_relaxed) -
+                            pending_.load(std::memory_order_relaxed) -
+                            lent_.load(std::memory_order_relaxed));
+    }
+
+    /// 借线程预算（供 blas::ScopedReservation 回调；调用方持预算锁，
+    /// 本类内部无锁）：**仅近空闲时出借**——运行+排队超过池的 1/4 就
+    /// 拒绝（洪泛期零干扰，避免 helper spawn 风暴；cant_31 实测无门控
+    /// 时 runOrder 14→28.5s）。可借数 = 池大小 − 运行中 − 排队 − 已借出。
+    /// 返回授予的**总**线程数（含调用者自身），借不到返回 1（串行）。
+    int acquireLend(int k) {
+        const int want = k - 1;
+        if (want <= 0) return 1;
+        const int size = static_cast<int>(workers_.size());
+        const int busy = running_.load(std::memory_order_relaxed) +
+                         pending_.load(std::memory_order_relaxed);
+        tl_lastGateBusy = busy;
+        tl_lastGateLent = lent_.load(std::memory_order_relaxed);
+        tl_lastGateSize = size;
+        if (busy > size / 4) {
+            gateBusyMax_.store(std::max(gateBusyMax_.load(
+                                            std::memory_order_relaxed),
+                                        busy),
+                               std::memory_order_relaxed);
+            gateRejects_.fetch_add(1, std::memory_order_relaxed);
+            tl_lastGateBusy = busy;
+            return 1;
+        }
+        for (;;) {
+            int lent = lent_.load(std::memory_order_relaxed);
+            const int avail = size - busy - lent;
+            const int grant = std::min(want, std::max(0, avail));
+            if (grant <= 0) return 1;
+            if (lent_.compare_exchange_weak(lent, lent + grant,
+                                            std::memory_order_relaxed))
+                return grant + 1;
+        }
+    }
+    void releaseLend(int n) {
+        if (n > 0) lent_.fetch_sub(n, std::memory_order_relaxed);
+    }
 
 private:
     struct PrioritizedTask {
@@ -114,6 +171,22 @@ private:
     std::priority_queue<PrioritizedTask, std::vector<PrioritizedTask>,
                         EarlierFirst>
         tasks_;
+    std::atomic<int> pending_{0};
+    std::atomic<int> running_{0};
+    std::atomic<int> lent_{0};
+    // 近空闲门拒绝诊断：拒绝次数 + 拒绝时见过的最大 busy。
+    std::atomic<int64_t> gateRejects_{0};
+    std::atomic<int> gateBusyMax_{0};
+
+public:
+    int64_t gateRejects() const {
+        return gateRejects_.load(std::memory_order_relaxed);
+    }
+    int gateBusyMax() const {
+        return gateBusyMax_.load(std::memory_order_relaxed);
+    }
+
+private:
     std::uint64_t seq_ = 0;
     bool stop_ = false;
 };

@@ -936,6 +936,14 @@ bool opsColAccBatchTrans(const ColCompMat& B,
         bs.transGatherNs.fetch_add(ns(tb0, tb1), std::memory_order_relaxed);
         bs.transGemmNs.fetch_add(ns(tb1, tb2), std::memory_order_relaxed);
         bs.transScatterNs.fetch_add(ns(tb2, tb3), std::memory_order_relaxed);
+        static const bool logBigT = std::getenv("AAMS_BATCH_LOG") != nullptr;
+        if (logBigT && ns(tb0, tb3) > 3000000)  // >3ms 的调用逐个打点
+            std::fprintf(stderr,
+                         "[batchT] nT=%zu vb=%lld nAll=%lld nb=%zu thr=%d "
+                         "gemm=%.2fms scatter=%.2fms\n",
+                         Cs.size(), (long long)B.validCols(),
+                         (long long)nAll, nb, opsTlsThreads(),
+                         ns(tb1, tb2) / 1e6, ns(tb2, tb3) / 1e6);
     }
     return true;
 }
