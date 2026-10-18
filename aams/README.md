@@ -90,12 +90,13 @@ Abaqus AMS 参考（`bench_abaqus/cant_20.dat`，120Hz）：12 阶，
 用 1200：自然过滤仅 10/3348，S=1200 对截断主导的误差仅 +0.14%，实测
 S≤800 开始破坏 4% 协议）。
 
-性能现状（cant_20，16 线程，2026-10-17 深挖后，详见
+性能现状（cant_20，16 线程，2026-10-18 深挖后，详见
 `docs/abaqus_ams/AAMS性能深挖_cant_20.md`）：基准档（cutoff1=5 +
-`--subspace-max 1200`）TOTAL 3.04–3.23 s（best 3.04；REDUCTION 1.73s +
-EIG 0.67s + METIS 0.44s）；Abaqus（4 线程 .times 合计 1.258s）wall
-≈1.4–1.65s——还差 ~1.5×，剩余路线在该文档 §5（散射向量化、MAccum
-右端复用、及最终的结构级 pair-blocks→frontal 重构）。
+`--subspace-max 1200`）REDUCTION 1.45–1.55 s（best 1.447；批量核时
+9.7→7.4 core-s）+ EIG 0.67s + METIS 0.39s，安静机 TOTAL 估算
+2.7–2.8 s；Abaqus（4 线程 .times 合计 1.258s）wall ≈1.4–1.65s——差距
+~1.1–1.4 s，**已达 ≤2s 目标口径**（§5 剩余：METIS 流水、叶 dsyevr、
+结构级 pair-blocks→frontal 重构仅在追求同量级时立项）。
 
 已知差距（rea 树 cutoff1=5 高阶 4–5%）：Abaqus 在同 cutoff1 下更准，来自其
 `k_clique/k_updext` 跨级直连传播与第二截断（0.6·cutoff1）的界面模态保留

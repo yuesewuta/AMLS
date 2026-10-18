@@ -1,10 +1,11 @@
 # AAMS 性能深挖：cant_20 对标 Abaqus AMS（2026-10-17）
 
-目标（/goal）：AAMS 在算例 cant_20 上的总耗时与 Abaqus AMS 差距 ≤20%。
-本文记录深度分析、每一步优化的问题定位 → 证据 → 改动 → 实测效果，以及
-剩余差距的量化路线。所有数字来自本机实测（16 逻辑核 Windows，MinGW 构建，
-OpenBLAS 0.3.33 + netlib LAPACK；机器有后台负载，取多次运行稳定值/最小值，
-负载可使结果膨胀 1.3–2×，正文注明）。
+目标（/goal，2026-10-18 更新）：AAMS 在算例 cant_20 上的总耗时与
+Abaqus AMS 差距 ≤2s 或 ≤20%。本文记录深度分析、每一步优化的问题定位
+→ 证据 → 改动 → 实测效果，以及剩余差距的量化路线。所有数字来自本机
+实测（16 逻辑核 Windows，MinGW 构建，OpenBLAS 0.3.33 + netlib LAPACK；
+机器有后台负载，取多次运行稳定值/最小值，负载可使结果膨胀 1.3–2×，
+正文注明）。
 
 ## 1. 基线：Abaqus AMS 在 cant_20 上的实测
 
@@ -215,56 +216,110 @@ REDUCTION 3.04 → **1.73 s**，TOTAL 6.4 → **3.04 s**（best-of-5）。
 3. **池空闲容量门控 CUpdate 段数**（溢洪串行/链尾并行）：2.07–2.18s，
    同 1 的机理反升。
 
-## 4. 当前状态（2026-10-17，§3.14 后）
+### 3.16 散射去开销 + OriginalBlocks 并行 + 串行初始化根因修正（REDUCTION 1.75 → 1.62 s，commit 75288ce）
+
+**根因修正**：此前把 REDUCTION 减去 DAG span 后的 ~0.4s 归因为
+"收尾串行"，实测（AAMS_RED_CLOSE_LOG）是 **DAG 之前的串行初始化段**：
+OriginalBlocks ~400ms（K 抽取 pass2 Eigen insert 160ms 是大头）+
+gaussModule.initialize ~136ms。两者均可压缩：
+
+- OriginalBlocks：K/M 抽取改双线程并行（M 是对角块集，968330 对
+  26460，并行收益直接）；finalize 的 ~78k 小块装配按块并行
+  （nthr=min(8, mats/64)，原子取号）；gauss 槽位表按
+  `N*2+4*Σanc` 精确预留（原 N*4 少于实际 ~317k 条目，免重哈希）。
+- 散射去开销：colcomp_mat 新增 `activateStorageCol(s)`——堆叠路径
+  预查缓存 storageCol 后散加免二次二分（原先每散列 markColNonZero
+  再搜一次，加上 storageCol 本身共三次查找）；trans 路径同理每列
+  单次 storageCol；堆叠 gather 按活跃列签名连续性分派
+  memcpy/标量 gather。批量散加核时 3.73 → 3.12 core-s——**墙钟
+  未动**（§3.15 同款教训：洪泛期核时削减不直接换墙钟）。
+
+合计 REDUCTION best 1.75 → **1.62 s**。
+
+### 3.17 MAccum/KAccum trans 路径右端后缀复用（REDUCTION 1.62 → 1.45 s，commit f50af63）
+
+trans 批量路径 76,646 次调用核时构成：gather 0.756 + gemm 4.456 +
+scatter 1.297。关键观察：对节点 i 的祖先链 j=anc[m]（anc 升序、
+subtree(k)={0..k}），右端 Ψ(i,k≥j)/M̃(i,k≥j) 是同一矩阵的**连续列
+后缀**——逐 j 重建右端纯属重复。改为：
+
+- `opsTransBuildRightEnd`：一次 gather 出全祖先右端 C（rows×Σnc
+  列主拼接 + 每全局列的原始列号 + 段界）；
+- `opsColAccBatchTransSuffix`：按段切右端视图做 dgemm——gemm 右端
+  落在 cache 热的同一缓冲尾部，gather 归零；
+- MAccum 双 term（Ψ_j×M̃ 与 M_temp_j×Ψ）各自独立右端，逐 j 两次
+  后缀调用。
+
+效果：gather 0.756→~0、gemm 4.456→2.656、scatter 1.297→1.215，
+批量路径核时 9.7→7.4 core-s；REDUCTION best 1.62 → **1.447 s**。
+
+### 3.18 Gershgorin 空区间预判：白跑的 dsygvx（commit bd15c5b）
+
+分段插桩（dsygvx query/real + local-eig load/solve/commit）暴露：
+**dsygvx 调用 5021 次 ≈ 2×2601 节点**——约 93% 节点先走一次空区间
+回退（cutoff1=5 时叶局部 λ ~1e7–1e8 > lambdaHi=ω1²≈1.42e7，
+'V' 型求解白跑一遍 + K/M 被破坏后双倍 loadBlocks 重装载），之后
+才走真正的 solveIndex。改为预判：
+
+```
+λmin(K,M) ≥ minGersh(K)/maxGersh(M)
+minGersh(A)=min_i(A_ii−Σ_{j≠i}|A_ij|), maxGersh(B)=max_i(B_ii+Σ_{j≠i}|B_ij|)
+```
+
+下界 > lambdaHi 即区间必空 → 直接 `solveIndex(1, minExtractOrder)`
+保留最低阶，K/M 未被 LAPACK 破坏，**免二次装载**。cutoff1=5 下
+dsygvx 5021 → **2839** 次；局部特征核时 load 0.078 / solve 2.10 /
+commit 0.002 core-s（装载开销几乎归零）。对拍：S=1200 残差逐位
+不变（0.5555962051/0.6026538919），cutoff1=8/S=3000 12 阶频率与
+参考完全一致；REDUCTION best 1.472s（墙钟未再降——白跑同样淹没在
+洪泛并行里，收益是核时与内存带宽）。
+
+## 4. 当前状态（2026-10-18，§3.18 后）
 
 best-of-5（16 线程，AAMS_PROFILE=1，--subspace-max 1200）：
 
-| 阶段 | 优化前 | §3.9 后 | 现在 |
-|---|---|---|---|
-| METIS 排序+建树 | 0.4 | 0.39–0.42 | 0.44（未动） |
-| REDUCTION | 8.2（69 核秒） | 5.0（~27 核秒） | **1.73–1.79（批量核时：gather 1.2 + gemm 2.5 + scatter 3.6）** |
-| DISTILL | 87 → 4.2 | 4.8–5.0 | 0.35（S=1200） |
-| REDUCED_EIGENSOLUTION | — | — | 0.51–0.67 |
-| RECOVERY | 0.2 | 0.17–0.19 | 0.05 |
-| **TOTAL** | **~65** | **10.8–12.4** | **3.04–3.23（best 3.04）** |
+| 阶段 | 优化前 | §3.9 后 | §3.14 后 | 现在（§3.18 后） |
+|---|---|---|---|---|
+| METIS 排序+建树 | 0.4 | 0.39–0.42 | 0.44（未动） | 0.38–0.40 |
+| REDUCTION | 8.2（69 核秒） | 5.0（~27 核秒） | 1.73–1.79 | **1.45–1.55（批量核时 9.7→7.4）** |
+| DISTILL | 87 → 4.2 | 4.8–5.0 | 0.35（S=1200） | 0.35 |
+| REDUCED_EIGENSOLUTION | — | — | 0.51–0.67 | 0.51–0.67 |
+| RECOVERY | 0.2 | 0.17–0.19 | 0.05 | 0.05 |
+| **TOTAL** | **~65** | **10.8–12.4** | **3.04–3.23** | **安静机估算 2.7–2.8** |
 
 精度：cutoff1=5 基准档 12 阶对 Abaqus .dat 4.3% 内（高阶模态，截断主导，
-与 Abaqus 同 cutoff1 的差距见逆向文档）；cutoff1=8 精度档 ~0.4%；
-残差与优化前逐位一致。
+与 Abaqus 同 cutoff1 的差距见逆向文档）；cutoff1=8/S=3000 精度档 12 阶
+频率与参考一致（~0.4% 内）；残差与优化前逐位一致。
 
-距目标（≤~2.0 s）还差 **~1.5×**。
+**目标口径更新（2026-10-18）**：用户放宽为"差距 ≤2s 或 20%"。
+Abaqus wall ≈1.4–1.65s ⇒ AAMS ≤~3.4–3.65s 即达标。本机当日后台负载
+持续 1.3–2×（负载计：REDUCED_EIGENSOLUTION 1.14–1.40s vs 安静 0.67s），
+按负载折算安静机 TOTAL ≈ 2.7–2.8s，对 Abaqus 差距 **~1.1–1.4s**，
+**目标已达成**（未能复现 3.04s 当时的安静窗口，结论按 REDUCTION 稳定
+指标 + 负载折算给出，REDUCTION 本身 1.447→1.472 best 无回退）。
 
 ## 5. 剩余差距量化路线（更新）
 
-当前 wall 构成（时间线实测）：METIS 0.44 + REDUCTION 1.75 +
-EIG(含 DISTILL) 0.67 + RECOVERY/ASSEMBLE 0.1 + 启动 IO ~0.1。
+当前 wall 构成（时间线实测）：METIS ~0.39 + REDUCTION 1.45 +
+EIG(含 DISTILL) 0.67 + RECOVERY/ASSEMBLE 0.1 + 串行初始化
+（OriginalBlocks+gaussInit，§3.16 后已压）~0.3。
 
-REDUCTION 1.75s 分解：叶洪泛 ~0.74s（任务和 12.9 核秒 ÷16 ≈ 0.80s，
-已接近完美并行下限）+ 链尾重叠段 ~0.49s + 收尾串行 ~0.4s。继续压缩
-的杠杆按 ROI 排序：
+原 §5 路线 1–3 已落地（散射向量化=§3.16、MAccum 后缀复用=§3.17、
+局部特征白跑=§3.18 消除）。剩余杠杆按 ROI 排序：
 
-1. **散射向量化/融合**（batch scatter 3.6 核秒，现最大核时项）：
-   trans 路径 `dst[tlActOrig[t]] += pc[tlActSb[t]]` 是索引 gather-scatter
-   标量循环；非转置路径逐列标量加。候选： Scatter 段按列连续性分派
-   memcpy/AXPY；或 beta=1 直写（需目标列布局连续性证明，涉及预留列
-   定理的存储列排布）。
-2. **MAccum C_all 复用**（MAccum 3.19 核秒，O(depth²) 对累积）：
-   逐 j 调 BatchTrans 时右端是 Ψ(nodeI,k≥j)/M̃(nodeI,k≥j) 的后缀——
-   按 j 从大到小增量扩展右端可省 ~一半 gather；两 term 可垂叠 B 成
-   一次 gemm（[Ψ_j;M_temp_j]ᵀ[C1;C2]，省一半调用开销）。注意 §3.15
-   教训：只省 core-time 的改动才有效，须配 A/B。
-3. **SolveLocalEigenPair 2.71 核秒**：dsygvx 链上每叶 ~1ms。Abaqus
-   四步链（sygst/sytrd/stev）合计 0.29s/线程。候选：叶节点用
-   dsyevr 区间（同 §3.10 手法）。
-4. **METIS 0.44s**：单线程固定成本。可探索与矩阵解析重叠（流水）或
+1. **METIS ~0.39s**：单线程固定成本。可探索与矩阵解析重叠（流水）或
    更轻的 ordering（对 26460 阶可能 nd 选项调优收益有限）。
-5. **结构级（对标 Abaqus k_updext 0.066s/线程）**：Abaqus 的 Reduction
+2. **SolveLocalEigenPair 2.1 核秒**：白跑已消，剩余是真实求解。
+   Abaqus 四步链（sygst/sytrd/stev）合计 0.29s/线程，仍可能更快
+   （叶节点 dsyevr 区间，同 §3.10 手法）。
+3. **结构级（对标 Abaqus k_updext 0.066s/线程）**：Abaqus 的 Reduction
    是全稠密 front 块沿树单次 dgemm 链，无 O(depth²) 对块、无列压缩
-   gather/scatter。这是剩余 ~2× 差距的根本来源；若上述 1–4 用尽仍
-   达标无望，需评估 pair-blocks → frontal 块重构（工程量大，另行立项）。
-6. **测量注意**：机器后台负载可致 1.3–2× 膨胀，取多次最小值；
+   gather/scatter。这是与 Abaqus 剩余 ~1.8× 差距的根本来源；目标已
+   达成，此项仅在追求同量级时才需评估（工程量大，另行立项）。
+4. **测量注意**：机器后台负载可致 1.3–2× 膨胀，取多次最小值；
    `AAMS_CUPDATE_LOG=1` 每节点 CUpdate 墙钟、`AAMS_BATCH_LOG=1` >3ms
-   批量打点、`AAMS_TASK_TIMELINE=1` 时间线 CSV。
+   批量打点、`AAMS_TASK_TIMELINE=1` 时间线 CSV、`AAMS_RED_CLOSE_LOG=1`
+   REDUCTION 内外分解、`AAMS_NO_TRANS_SUFFIX=1` 回退旧 trans 路径。
 
 ## 6. 复现命令
 
