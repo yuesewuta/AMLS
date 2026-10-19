@@ -39,6 +39,11 @@ struct OpAccStats {
     // trans 路径（MAccum/KAccum）单独分段：与堆叠路径区分归因
     std::atomic<uint64_t> transCalls{0};
     std::atomic<uint64_t> transGatherNs{0}, transGemmNs{0}, transScatterNs{0};
+    // 直写快路径（AAMS_TRANS_DIRECT）命中/回退计数
+    std::atomic<uint64_t> transDirect{0}, transIndirect{0};
+    // flops / 散射体量：区分"算得多"（算法公式）与"算得慢"（实现）。
+    std::atomic<uint64_t> transFlops{0}, transScatterElems{0};
+    std::atomic<uint64_t> batchFlops{0}, batchScatterElems{0};
 };
 OpAccStats& opAccStats() {
     static OpAccStats s;
@@ -91,6 +96,25 @@ void colOpsDumpStats() {
                  static_cast<double>(st.transGatherNs.load(std::memory_order_relaxed)) * 1e-9,
                  static_cast<double>(st.transGemmNs.load(std::memory_order_relaxed)) * 1e-9,
                  static_cast<double>(st.transScatterNs.load(std::memory_order_relaxed)) * 1e-9);
+    // flops/散射体量：batch=堆叠路径（CompressUpdate），trans=转置路径
+    // （KAccum/MAccum）。gemm GF/s 与 散射 GB/s 直接对照 Abaqus flop 模型。
+    std::fprintf(stderr,
+                 "[prof] colAcc flops: batch=%.3e (%.1f GF/s gemm) scatterElems=%.3e (%.2f GB written)\n"
+                 "[prof] colAcc flops: trans=%.3e (%.1f GF/s gemm) scatterElems=%.3e (%.2f GB written)\n",
+                 static_cast<double>(st.batchFlops.load(std::memory_order_relaxed)),
+                 static_cast<double>(st.batchFlops.load(std::memory_order_relaxed)) /
+                     (static_cast<double>(st.batchGemmNs.load(std::memory_order_relaxed)) + 1.0),
+                 static_cast<double>(st.batchScatterElems.load(std::memory_order_relaxed)),
+                 static_cast<double>(st.batchScatterElems.load(std::memory_order_relaxed)) * 8.0 / 1073741824.0,
+                 static_cast<double>(st.transFlops.load(std::memory_order_relaxed)),
+                 static_cast<double>(st.transFlops.load(std::memory_order_relaxed)) /
+                     (static_cast<double>(st.transGemmNs.load(std::memory_order_relaxed)) + 1.0),
+                 static_cast<double>(st.transScatterElems.load(std::memory_order_relaxed)),
+                 static_cast<double>(st.transScatterElems.load(std::memory_order_relaxed)) * 8.0 / 1073741824.0);
+    std::fprintf(stderr,
+                 "[prof] colAcc direct: hits=%llu misses=%llu\n",
+                 (unsigned long long)st.transDirect.load(std::memory_order_relaxed),
+                 (unsigned long long)st.transIndirect.load(std::memory_order_relaxed));
 }
 
 int32_t sytrfFactor(DefaultTraits::DenseMatrix& a,
@@ -652,6 +676,7 @@ bool opsColAccBatchStacked(
 
     const auto tb0 = std::chrono::steady_clock::now();
     uint64_t gathNs = 0, gemmNs = 0, scatNs = 0;
+    uint64_t flopAcc = 0, scatElems = 0;
     static thread_local std::vector<double> tlCAll, tlLStack, tlY;
     static thread_local std::vector<int64_t> tlScol;
     for (const auto& [sig, js] : groups) {
@@ -729,6 +754,9 @@ bool opsColAccBatchStacked(
                          tlCAll.data(), static_cast<int>(actB), 0.0,
                          tlY.data(), static_cast<int>(rowsSum),
                          opsTlsThreads());
+            flopAcc += 2ull * static_cast<uint64_t>(actB) *
+                       static_cast<uint64_t>(nAll) *
+                       static_cast<uint64_t>(rowsSum);
             const auto tc2 = std::chrono::steady_clock::now();
             // 逐 (d, 祖先) 持锁散加：Y 行块 [rowOff, rowOff+rows) 映射回
             // 各目标列。覆盖性预检在锁外一次算出存储列号并缓存（散加与
@@ -774,6 +802,8 @@ bool opsColAccBatchStacked(
                         for (int64_t r = 0; r < rj; ++r) dst[r] += ycol[r];
                         A.activateStorageCol(sc);
                     }
+                    scatElems += static_cast<uint64_t>(rj) *
+                                 static_cast<uint64_t>(tEnd - tBeg);
                 }
                 rowOff += rj;
             }
@@ -806,6 +836,8 @@ bool opsColAccBatchStacked(
         bs.batchGatherNs.fetch_add(gathNs, std::memory_order_relaxed);
         bs.batchGemmNs.fetch_add(gemmNs, std::memory_order_relaxed);
         bs.batchScatterNs.fetch_add(scatNs, std::memory_order_relaxed);
+        bs.batchFlops.fetch_add(flopAcc, std::memory_order_relaxed);
+        bs.batchScatterElems.fetch_add(scatElems, std::memory_order_relaxed);
         static const bool logBig = std::getenv("AAMS_BATCH_LOG") != nullptr;
         if (logBig && ns(tb0, tb3) > 3000000)  // >3ms 的调用逐个打点
             std::fprintf(stderr,
@@ -877,6 +909,9 @@ bool opsColAccBatchTrans(const ColCompMat& B,
                  static_cast<int>(B.rows()), 0.0, tlProd.data(),
                  static_cast<int>(B.validCols()), opsTlsThreads());
     const auto tb2 = std::chrono::steady_clock::now();
+    const uint64_t transFlopsLocal =
+        2ull * static_cast<uint64_t>(B.validCols()) *
+        static_cast<uint64_t>(nAll) * static_cast<uint64_t>(B.rows());
 
     // 逐目标持锁散射各自列段：dst[B.origColAt(sb)] += prod(sb, g)。
     // B 活跃原始列/存储列均连续时内层退化为连续 AXPY（免索引散写）。
@@ -936,6 +971,10 @@ bool opsColAccBatchTrans(const ColCompMat& B,
         bs.transGatherNs.fetch_add(ns(tb0, tb1), std::memory_order_relaxed);
         bs.transGemmNs.fetch_add(ns(tb1, tb2), std::memory_order_relaxed);
         bs.transScatterNs.fetch_add(ns(tb2, tb3), std::memory_order_relaxed);
+        bs.transFlops.fetch_add(transFlopsLocal, std::memory_order_relaxed);
+        bs.transScatterElems.fetch_add(
+            static_cast<uint64_t>(nb) * static_cast<uint64_t>(nAll),
+            std::memory_order_relaxed);
         static const bool logBigT = std::getenv("AAMS_BATCH_LOG") != nullptr;
         if (logBigT && ns(tb0, tb3) > 3000000)  // >3ms 的调用逐个打点
             std::fprintf(stderr,
@@ -1012,11 +1051,94 @@ bool opsColAccBatchTransSuffix(const ColCompMat& B, const TransRightEnd& re,
         tlActOrig.push_back(B.origColAt(sb));
     }
     if (tlActSb.empty()) return true;
+    // B 活跃原始列/存储列均连续时内层退化为连续 AXPY（免索引散写）。
+    const size_t nb = tlActSb.size();
+    bool actRun = true;
+    for (size_t t = 1; t < nb; ++t)
+        if (tlActOrig[t] != tlActOrig[0] + static_cast<int64_t>(t) ||
+            tlActSb[t] != tlActSb[0] + static_cast<int64_t>(t)) {
+            actRun = false;
+            break;
+        }
+    const int64_t o0 = tlActOrig[0];
+    const int64_t sb0 = tlActSb[0];
+    const auto tt0 = opAccEnabled() ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+    // 直接更新快路径（Abaqus tri_rectupdate 语义）：B 存储布局原始列连续
+    // 且各目标段存储列连续时，dgemm β=1 直写目标列块，免乘积物化与逐列
+    // 散射。B 占位行乘积恒零，直写无害。AAMS_TRANS_DIRECT=1 启用（实验）。
+    static const bool directPath = std::getenv("AAMS_TRANS_DIRECT") != nullptr;
+    if (directPath) {
+        bool ok = true;
+        for (int64_t s = 0; s + 1 < B.validCols(); ++s)
+            if (B.origColAt(s) + 1 != B.origColAt(s + 1)) {
+                ok = false;
+                break;
+            }
+        if (ok) {
+            for (int64_t seg = segBegIdx; seg < nSeg && ok; ++seg) {
+                ColCompMat& A = *targets[static_cast<size_t>(seg - segBegIdx)];
+                const int64_t b = re.segBeg[static_cast<size_t>(seg)];
+                const int64_t e = re.segBeg[static_cast<size_t>(seg + 1)];
+                if (b == e) continue;
+                int64_t prev = -2;
+                for (int64_t g = b; g < e; ++g) {
+                    const int64_t sc =
+                        A.storageCol(re.orig[static_cast<size_t>(g)]);
+                    if (sc < 0 || (prev >= 0 && sc != prev + 1)) {
+                        ok = false;
+                        break;
+                    }
+                    prev = sc;
+                }
+            }
+        }
+        if (ok) {
+            auto& bs = opAccStats();
+            bs.transDirect.fetch_add(1, std::memory_order_relaxed);
+            const int64_t base = B.origColAt(0);
+            for (int64_t seg = segBegIdx; seg < nSeg; ++seg) {
+                ColCompMat& A = *targets[static_cast<size_t>(seg - segBegIdx)];
+                std::mutex* m = mtxs[static_cast<size_t>(seg - segBegIdx)];
+                const int64_t b = re.segBeg[static_cast<size_t>(seg)];
+                const int64_t e = re.segBeg[static_cast<size_t>(seg + 1)];
+                if (b == e) continue;
+                const int64_t sc0 = A.storageCol(re.orig[static_cast<size_t>(b)]);
+                std::unique_lock<std::mutex> lock;
+                if (m) lock = std::unique_lock<std::mutex>(*m);
+                double* cPtr = A.dense().data() +
+                               static_cast<size_t>(sc0) * A.rows() + base;
+                dgemmColsRaw(CblasTrans, static_cast<int>(B.validCols()),
+                             static_cast<int>(e - b),
+                             static_cast<int>(B.rows()), 1.0,
+                             B.dense().data(), static_cast<int>(B.rows()),
+                             re.c.data() + b * B.rows(),
+                             static_cast<int>(B.rows()), 1.0, cPtr,
+                             static_cast<int>(A.rows()), opsTlsThreads());
+                for (int64_t sc = sc0; sc < sc0 + (e - b); ++sc)
+                    A.activateStorageCol(sc);
+            }
+            if (opAccEnabled()) {
+                bs.transCalls.fetch_add(1, std::memory_order_relaxed);
+                bs.transGemmNs.fetch_add(
+                    static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - tt0)
+                            .count()),
+                    std::memory_order_relaxed);
+                bs.transFlops.fetch_add(
+                    2ull * static_cast<uint64_t>(B.validCols()) *
+                        static_cast<uint64_t>(ncols) *
+                        static_cast<uint64_t>(B.rows()),
+                    std::memory_order_relaxed);
+            }
+            return true;
+        }
+        opAccStats().transIndirect.fetch_add(1, std::memory_order_relaxed);
+    }
 
     static thread_local std::vector<double> tlProd;
     tlProd.resize(static_cast<size_t>(B.validCols() * ncols));
-    const auto tt0 = opAccEnabled() ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
     dgemmColsRaw(CblasTrans, static_cast<int>(B.validCols()),
                  static_cast<int>(ncols), static_cast<int>(B.rows()), 1.0,
                  B.dense().data(), static_cast<int>(B.rows()),
@@ -1053,8 +1175,15 @@ bool opsColAccBatchTransSuffix(const ColCompMat& B, const TransRightEnd& re,
         for (int64_t g = b; g < e; ++g) {
             const int64_t scA = tlScol[static_cast<size_t>(g - b)];
             double* __restrict dst = A.dense().col(scA).data();
-            for (size_t t = 0; t < tlActSb.size(); ++t)
-                dst[tlActOrig[t]] += pc[tlActSb[t]];
+            if (actRun) {
+                const double* __restrict y = pc + sb0;
+                double* __restrict d = dst + o0;
+                for (int64_t r = 0; r < static_cast<int64_t>(nb); ++r)
+                    d[r] += y[r];
+            } else {
+                for (size_t t = 0; t < tlActSb.size(); ++t)
+                    dst[tlActOrig[t]] += pc[tlActSb[t]];
+            }
             A.activateStorageCol(scA);
             pc += B.validCols();
         }
@@ -1074,6 +1203,167 @@ bool opsColAccBatchTransSuffix(const ColCompMat& B, const TransRightEnd& re,
         bs.transGatherNs.fetch_add(0, std::memory_order_relaxed);
         bs.transGemmNs.fetch_add(ns(tt0, tt1), std::memory_order_relaxed);
         bs.transScatterNs.fetch_add(ns(tt1, tt2), std::memory_order_relaxed);
+        bs.transFlops.fetch_add(
+            2ull * static_cast<uint64_t>(B.validCols()) *
+                static_cast<uint64_t>(ncols) *
+                static_cast<uint64_t>(B.rows()),
+            std::memory_order_relaxed);
+        bs.transScatterElems.fetch_add(
+            static_cast<uint64_t>(tlActSb.size()) *
+                static_cast<uint64_t>(ncols),
+            std::memory_order_relaxed);
+    }
+    return true;
+}
+
+bool opsColAccFullProductTrans(
+    const std::vector<const ColCompMat*>& lefts,
+    const std::vector<const ColCompMat*>& rights,
+    const std::vector<std::vector<ColCompMat*>>& targetsPerLeft,
+    const std::vector<std::vector<std::mutex*>>& mtxsPerLeft) {
+    constexpr const char* kWho = "opsColAccFullProductTrans";
+    if (lefts.size() != targetsPerLeft.size() ||
+        lefts.size() != mtxsPerLeft.size() || rights.empty()) {
+        AMLS_LOG_ERROR("[colops] {} 失败：lefts/targets/mtxs 数量不一致。",
+                       kWho);
+        return false;
+    }
+    for (size_t m = 0; m < lefts.size(); ++m) {
+        if (targetsPerLeft[m].size() != mtxsPerLeft[m].size() ||
+            targetsPerLeft[m].size() != rights.size() - m) {
+            AMLS_LOG_ERROR("[colops] {} 失败：左块 {} 的目标数 {} ≠ 右块后缀 {}。",
+                           kWho, m, targetsPerLeft[m].size(),
+                           rights.size() - m);
+            return false;
+        }
+    }
+    const int64_t rows = lefts.front()->rows();
+    for (const ColCompMat* l : lefts)
+        if (!colCompShapeOk(kWho, "L", *l) || l->rows() != rows) {
+            AMLS_LOG_ERROR("[colops] {} 失败：左块行数 {} ≠ {}。", kWho,
+                           l->rows(), rows);
+            return false;
+        }
+    for (const ColCompMat* r : rights)
+        if (!colCompShapeOk(kWho, "R", *r) || r->rows() != rows) {
+            AMLS_LOG_ERROR("[colops] {} 失败：右块行数 {} ≠ {}。", kWho,
+                           r->rows(), rows);
+            return false;
+        }
+
+    // 活跃列计数与段偏移（左端 = P 的行，右端 = P 的列）
+    const size_t nL = lefts.size(), nR = rights.size();
+    std::vector<int64_t> leftCnt(nL + 1, 0), rightCnt(nR + 1, 0);
+    for (size_t m = 0; m < nL; ++m)
+        leftCnt[m + 1] = leftCnt[m] + lefts[m]->activeCols();
+    for (size_t t = 0; t < nR; ++t)
+        rightCnt[t + 1] = rightCnt[t] + rights[t]->activeCols();
+    const int64_t mAll = leftCnt[nL], nAll = rightCnt[nR];
+    if (mAll == 0 || nAll == 0 || rows == 0) return true;
+
+    const auto tf0 = opAccEnabled() ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+    static thread_local std::vector<double> tlL, tlR, tlP;
+    tlL.resize(static_cast<size_t>(rows * mAll));
+    tlR.resize(static_cast<size_t>(rows * nAll));
+    {
+        double* ld = tlL.data();
+        double* rd = tlR.data();
+        for (size_t m = 0; m < nL; ++m) {
+            const ColCompMat& l = *lefts[m];
+            for (int64_t sc = 0; sc < l.validCols(); ++sc) {
+                if (!l.colActive(sc)) continue;
+                std::memcpy(ld, l.dense().col(sc).data(),
+                            static_cast<size_t>(rows) * sizeof(double));
+                ld += rows;
+            }
+        }
+        for (size_t t = 0; t < nR; ++t) {
+            const ColCompMat& r = *rights[t];
+            for (int64_t sc = 0; sc < r.validCols(); ++sc) {
+                if (!r.colActive(sc)) continue;
+                std::memcpy(rd, r.dense().col(sc).data(),
+                            static_cast<size_t>(rows) * sizeof(double));
+                rd += rows;
+            }
+        }
+    }
+    tlP.resize(static_cast<size_t>(mAll * nAll));
+    dgemmColsRaw(CblasTrans, static_cast<int>(mAll), static_cast<int>(nAll),
+                 static_cast<int>(rows), 1.0, tlL.data(),
+                 static_cast<int>(rows), tlR.data(), static_cast<int>(rows),
+                 0.0, tlP.data(), static_cast<int>(mAll), opsTlsThreads());
+    const auto tf1 = opAccEnabled() ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+
+    // 左/右活跃列原始列号平铺（与 gather 顺序一致）；散射：左段 m 外层、
+    // 右段 t ≥ m 内层。P 列主序 (row, col) = tlP[col * mAll + row]，行内连续。
+    static thread_local std::vector<int64_t> tlLOrig, tlROrig, tlScol;
+    tlLOrig.clear();
+    tlROrig.clear();
+    for (size_t m = 0; m < nL; ++m)
+        for (int64_t sc = 0; sc < lefts[m]->validCols(); ++sc)
+            if (lefts[m]->colActive(sc))
+                tlLOrig.push_back(lefts[m]->origColAt(sc));
+    for (size_t t = 0; t < nR; ++t)
+        for (int64_t sc = 0; sc < rights[t]->validCols(); ++sc)
+            if (rights[t]->colActive(sc))
+                tlROrig.push_back(rights[t]->origColAt(sc));
+
+    uint64_t scatElems = 0;
+    for (size_t m = 0; m < nL; ++m) {
+        if (leftCnt[m + 1] == leftCnt[m]) continue;
+        const int64_t mB = leftCnt[m], mE = leftCnt[m + 1];
+        for (size_t t = m; t < nR; ++t) {
+            ColCompMat& A = *targetsPerLeft[m][t - m];
+            std::mutex* mtx = mtxsPerLeft[m][t - m];
+            const int64_t cB = rightCnt[t], cE = rightCnt[t + 1];
+            if (cB == cE) continue;
+            tlScol.resize(static_cast<size_t>(cE - cB));
+            for (int64_t g = cB; g < cE; ++g) {
+                const int64_t scA =
+                    A.storageCol(tlROrig[static_cast<size_t>(g)]);
+                if (scA < 0) {
+                    AMLS_LOG_ERROR(
+                        "[colops] {} 失败：目标存储列未覆盖源活跃列（原始列 {}）。",
+                        kWho, tlROrig[static_cast<size_t>(g)]);
+                    return false;
+                }
+                tlScol[static_cast<size_t>(g - cB)] = scA;
+            }
+            std::unique_lock<std::mutex> lock;
+            if (mtx) lock = std::unique_lock<std::mutex>(*mtx);
+            const double* pc =
+                tlP.data() + static_cast<size_t>(cB) * mAll + mB;
+            for (int64_t g = cB; g < cE; ++g) {
+                double* __restrict dst =
+                    A.dense().col(tlScol[static_cast<size_t>(g - cB)]).data();
+                for (int64_t p = 0; p < mE - mB; ++p)
+                    dst[tlLOrig[static_cast<size_t>(mB + p)]] += pc[p];
+                A.activateStorageCol(tlScol[static_cast<size_t>(g - cB)]);
+                pc += mAll;
+            }
+            scatElems += static_cast<uint64_t>(mE - mB) *
+                         static_cast<uint64_t>(cE - cB);
+        }
+    }
+    if (opAccEnabled()) {
+        const auto tf2 = std::chrono::steady_clock::now();
+        auto& bs = opAccStats();
+        const auto ns = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
+        };
+        bs.transCalls.fetch_add(1, std::memory_order_relaxed);
+        bs.transGatherNs.fetch_add(0, std::memory_order_relaxed);
+        bs.transGemmNs.fetch_add(ns(tf0, tf1), std::memory_order_relaxed);
+        bs.transScatterNs.fetch_add(ns(tf1, tf2), std::memory_order_relaxed);
+        bs.transFlops.fetch_add(
+            2ull * static_cast<uint64_t>(mAll) *
+                static_cast<uint64_t>(nAll) * static_cast<uint64_t>(rows),
+            std::memory_order_relaxed);
+        bs.transScatterElems.fetch_add(scatElems, std::memory_order_relaxed);
     }
     return true;
 }

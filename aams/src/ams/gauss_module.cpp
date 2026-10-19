@@ -164,14 +164,27 @@ bool GaussEliminationModule::initialize(const OriginalBlocks& blocks) {
         slots_.clear();
         return false;
     }
-    if (std::getenv("AAMS_RED_CLOSE_LOG"))
-        std::fprintf(stderr, "[ginit] slots=%.1fms plan=%.1fms\n",
-                     std::chrono::duration<double, std::milli>(gsplit -
-                                                               gstart)
+    if (std::getenv("AAMS_RED_CLOSE_LOG")) {
+        // 布局内存盘点：稠密 frontal 化（n_d×n_a 全满）vs 现列压缩
+        //（validCols×rows）的对比，评估 frontal 化可行性。
+        double denseBytes = 0, planBytes = 0;
+        for (const auto& [key, entry] : slots_) {
+            const ColCompMat& m = entry->matrix;
+            if (!m.layoutReady()) continue;
+            denseBytes += static_cast<double>(m.rows()) * m.totalCols() * 8;
+            planBytes += static_cast<double>(m.rows()) * m.validCols() * 8;
+        }
+        std::fprintf(stderr,
+                     "[ginit] slots=%.1fms plan=%.1fms mem dense=%.2fGB "
+                     "planned=%.2fGB ratio=%.2f\n",
+                     std::chrono::duration<double, std::milli>(gsplit - gstart)
                          .count(),
                      std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - gsplit)
-                         .count());
+                         .count(),
+                     denseBytes / 1e9, planBytes / 1e9,
+                     planBytes > 0 ? denseBytes / planBytes : 0.0);
+    }
     return true;
 }
 
@@ -378,6 +391,56 @@ bool GaussEliminationModule::accumulateReducedStiffness(int64_t nodeI) {
     }
     static const bool noSuffix =
         std::getenv("AAMS_NO_TRANS_SUFFIX") != nullptr;
+    static const bool legacyTransK =
+        std::getenv("AAMS_TRANS_FULL") != nullptr;
+    // 全积路径（AAMS_TRANS_FULL=1 实验）：左端 Ψ(I,·) 堆叠 + 右端 K̃(I,·)
+    // 一次全积 gemm。实测负结果（cant_31 REDUCTION 13.65 → 15.84s）：
+    // DAG 洪泛期 opsTlsThreads = cap/inFlight ≈ 1，大 gemm 不涨 GF/s 只涨
+    // flops（trans 4.95e11 → 6.48e11，GF/s 17.0 → 15.4）。默认走后缀路径。
+    if (!noSuffix && legacyTransK && !anc.empty()) {
+        std::vector<const ColCompMat*> lefts, rights;
+        std::vector<std::vector<ColCompMat*>> targetsPerLeft(anc.size());
+        std::vector<std::vector<std::mutex*>> mtxsPerLeft(anc.size());
+        lefts.reserve(anc.size());
+        rights.reserve(anc.size());
+        for (int64_t j : anc) lefts.push_back(getPsi(nodeI, j));
+        for (size_t t = 0; t < anc.size(); ++t) {
+            const int64_t k = anc[t];
+            ColCompMat* source = nullptr;
+            Entry* entry = slot_(reducedKey_(true, nodeI, k));
+            if (!entry) {
+                AMLS_LOG_ERROR(
+                    "accumulateReducedStiffness 失败：K 源块 ({},{}) 槽位缺失。",
+                    nodeI, k);
+                return false;
+            }
+            if (!ensureReduced_(true, nodeI, k, *entry, source)) return false;
+            rights.push_back(source);
+        }
+        for (size_t m = 0; m < anc.size(); ++m) {
+            const int64_t j = anc[m];
+            for (size_t t = m; t < anc.size(); ++t) {
+                const int64_t k = anc[t];
+                Entry* targetEntry = slot_(reducedKey_(true, j, k));
+                if (!targetEntry) {
+                    AMLS_LOG_ERROR("accumulateReducedStiffness 失败：K 目标块 "
+                                   "({},{}) 槽位缺失。",
+                                   j, k);
+                    return false;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(targetEntry->mtx);
+                    ColCompMat* target = nullptr;
+                    if (!ensureReduced_(true, j, k, *targetEntry, target))
+                        return false;
+                    targetsPerLeft[m].push_back(target);
+                }
+                mtxsPerLeft[m].push_back(&targetEntry->mtx);
+            }
+        }
+        return opsColAccFullProductTrans(lefts, rights, targetsPerLeft,
+                                         mtxsPerLeft);
+    }
     // 共享右端：全部 k ∈ anc 的 K̃(nodeI,k) 有效列只拼一次；anc 升序，
     // j = anc[m] 的目标 k≥j 恰为段后缀 [m, nSeg)。|anc|² 次小乘法摊成
     // |anc| 次 + 一遍 gather。

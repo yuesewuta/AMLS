@@ -112,6 +112,23 @@ bool opsColAccBatchTransSuffix(const ColCompMat& B, const TransRightEnd& re,
                                const std::vector<ColCompMat*>& targets,
                                const std::vector<std::mutex*>& mtxs);
 
+/// 全积批量转置累加（frontal 化 Slice 1）：P = L_allᵀ · R_all 单次 gemm，
+/// 其中 L_all/lefts[m] 与 R_all/rights[t] 均只取活跃列拼接；随后对全部
+/// m ≤ t 组合散射 targetsPerLeft[m][t-m] += P[lefts[m] 段, rights[t] 段]
+/// （行号 = 左块活跃列原始列号，列号 = 右块活跃列原始列号）。
+///
+/// 与逐 (m,t) 调 opsColAccBatchTransSuffix 相比：gemm 的 m 维从单个 n_j
+/// （≈4，memory-bound）批量化为 Σ n_j（大 m/n/k 的计算型 gemm），代价是
+/// 下三角 (m>t) 的浪费 flops（≈2×，且浪费集中在小 n 侧）。
+/// lefts[m] 0 活跃列按恒零贡献跳过，对应目标仍需调用方倒计数。
+/// mtx 为 nullptr 表示无锁。同一目标块元素仍按 (m,t) 升序各加一次，
+/// 仅 gemm 内部分块次序差异容末位 ulp。
+bool opsColAccFullProductTrans(
+    const std::vector<const ColCompMat*>& lefts,
+    const std::vector<const ColCompMat*>& rights,
+    const std::vector<std::vector<ColCompMat*>>& targetsPerLeft,
+    const std::vector<std::vector<std::mutex*>>& mtxsPerLeft);
+
 /// 输出 opsColAcc gemv/gemm 剖析计数（AAMS_PROFILE=1 时生效）。
 void colOpsDumpStats();
 
